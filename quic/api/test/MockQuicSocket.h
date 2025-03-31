@@ -26,6 +26,9 @@ class MockQuicSocket : public QuicSocket {
       ConnectionCallback* connCb)
       : setupCb_(setupCb), connCb_(connCb) {}
 
+  MOCK_METHOD((void), setClientConnIdx, (int64_t), (const));
+  MOCK_METHOD((void), setMultiPath, (bool), (const));
+
   MOCK_METHOD(bool, good, (), (const));
   MOCK_METHOD(bool, replaySafe, (), (const));
   MOCK_METHOD(bool, error, (), (const));

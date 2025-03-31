@@ -94,6 +94,16 @@ class QuicSocket : virtual public QuicSocketLite {
   virtual Optional<ConnectionId> getClientConnectionId() const = 0;
 
   /**
+   * Set the QUIC Client Connection IDX number
+   */
+  virtual void setClientConnIdx(int64_t idx) const = 0;
+
+  /**
+   * Set the multi-path flag
+   */
+  virtual void setMultiPath(bool isMultiPath) const = 0;
+
+  /**
    * Get the QUIC Server Connection ID
    */
   virtual Optional<ConnectionId> getServerConnectionId() const = 0;

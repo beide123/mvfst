@@ -24,6 +24,13 @@ class StreamReadCallback {
    */
   virtual void readAvailable(StreamId id) noexcept = 0;
 
+  /**
+   * Multi-path version of readAvailable
+   * Called from the transport layer when there is data, EOF or an error
+   * available to read on the given stream ID
+   */
+  virtual void readAvailable(StreamId id, int64_t connId) noexcept = 0;
+
   /*
    * Same as above, but called on streams within a group.
    */
@@ -57,6 +64,19 @@ class StreamWriteCallback {
    *   min(remaining flow control, remaining send buffer space)
    */
   virtual void onStreamWriteReady(
+      StreamId /* id */,
+      uint64_t /* maxToSend */) noexcept {}
+  
+  /**
+   * Invoked when multipath stream is ready to write after notifyPendingWriteOnStream
+   * has previously been called.
+   *
+   * maxToSend represents the amount of data that the transport layer expects
+   * to write to the network during this event loop, eg:
+   *   min(remaining flow control, remaining send buffer space)
+   */
+  virtual void onMultiStreamWriteReady(
+      int64_t  /* connId */,
       StreamId /* id */,
       uint64_t /* maxToSend */) noexcept {}
 

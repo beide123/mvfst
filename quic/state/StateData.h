@@ -363,6 +363,9 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
   // verification. This is used to decide whether the next variable should be
   // updated or not.
   bool oneRttWritePendingVerification{false};
+
+  // Whether this connection is a multi-path connection, add by Emma
+  bool isMultiPath{false};
   // In a key update is pending, this holds the first packet number sent in the
   // current (updated) phase. The peer must acknowledge this packet in the same
   // phase, responding in a different phase is a protocol violation. Once the

@@ -48,6 +48,7 @@ class MockReadCallback : public QuicSocket::ReadCallback {
  public:
   ~MockReadCallback() override = default;
   MOCK_METHOD((void), readAvailable, (StreamId), (noexcept));
+  MOCK_METHOD((void), readAvailable, (StreamId, int64_t), (noexcept));
   MOCK_METHOD(
       (void),
       readAvailableWithGroup,
@@ -76,6 +77,7 @@ class MockDatagramCallback : public QuicSocket::DatagramCallback {
  public:
   ~MockDatagramCallback() override = default;
   MOCK_METHOD((void), onDatagramsAvailable, (), (noexcept));
+  MOCK_METHOD((void), onDatagramsAvailable, (int64_t), (noexcept));
 };
 
 class MockWriteCallback : public QuicSocket::WriteCallback {
@@ -103,6 +105,7 @@ class MockConnectionCallback : public QuicSocket::ConnectionCallback {
 
   MOCK_METHOD((void), onFlowControlUpdate, (StreamId), (noexcept));
   MOCK_METHOD((void), onNewBidirectionalStream, (StreamId), (noexcept));
+  MOCK_METHOD((void), onMultiNewBidirectionalStream, (int64_t, StreamId), (noexcept));
   MOCK_METHOD(
       (void),
       onNewBidirectionalStreamGroup,

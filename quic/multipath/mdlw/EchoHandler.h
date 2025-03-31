@@ -11,8 +11,11 @@
 
 #include <quic/common/BufUtil.h>
 
-namespace quic::samples {
-class EchoHandler : public quic::QuicSocket::ConnectionSetupCallback,
+#include <future>
+
+namespace quic::multipath {
+
+class DlwHandler : public quic::QuicSocket::ConnectionSetupCallback,
                     public quic::QuicSocket::ConnectionCallback,
                     public quic::QuicSocket::ReadCallback,
                     public quic::QuicSocket::WriteCallback,
@@ -20,7 +23,7 @@ class EchoHandler : public quic::QuicSocket::ConnectionSetupCallback,
  public:
   using StreamData = std::pair<BufQueue, bool>;
 
-  explicit EchoHandler(
+  explicit DlwHandler(
       folly::EventBase* evbIn,
       bool useDatagrams = false,
       bool disableRtx = false)
@@ -39,8 +42,8 @@ class EchoHandler : public quic::QuicSocket::ConnectionSetupCallback,
     sock->setReadCallback(id, this);
   }
 
-  void onMultiNewBidirectionalStream(int64_t connId, StreamId id) noexcept override {
-    std::cout << "New bidirectional stream " << id << " on connection " << connId << std::endl;
+  void onMultiNewBidirectionalStream(int64_t connId, quic::StreamId id) noexcept override {
+    LOG(INFO) << "Got bidirectional stream id=" << id;
   }
 
   void onNewBidirectionalStreamGroup(
@@ -117,21 +120,22 @@ class EchoHandler : public quic::QuicSocket::ConnectionSetupCallback,
     quic::Buf data = std::move(res.value().first);
     bool eof = res.value().second;
     auto dataLen = (data ? data->computeChainDataLength() : 0);
-    LOG(INFO) << "Got len=" << dataLen << " eof=" << uint32_t(eof)
+    VLOG(4) << "Got len=" << dataLen << " eof=" << uint32_t(eof)
               << " total=" << input_[id].first.chainLength() + dataLen
               << " data="
               << ((data) ? data->clone()->to<std::string>() : std::string());
     input_[id].first.append(std::move(data));
     input_[id].second = eof;
-    if (eof) {
-      echo(id, input_[id]);
+    if (dataLen > 0) {
+      //echo(id, input_[id]);
+      handleMP4Request(id, input_[id]);
       LOG(INFO) << "uninstalling read callback";
-      sock->setReadCallback(id, nullptr);
+      sock->setReadCallback(id, this);
     }
   }
 
-  void readAvailable(quic::StreamId streamId, int64_t connId) noexcept override{
-    LOG(INFO) << "read available for stream id=" << streamId << " on connection " << connId;
+  void readAvailable(quic::StreamId id, int64_t connId) noexcept override {
+    LOG(INFO) << "read available for stream id=" << id << " connId=" << connId;
   }
 
   void readAvailableWithGroup(
@@ -196,8 +200,8 @@ class EchoHandler : public quic::QuicSocket::ConnectionSetupCallback,
   }
 
   void onDatagramsAvailable(int64_t connId) noexcept override {
-    LOG(INFO) << "Datagrams available on connection " << connId;
-  }
+    LOG(INFO) << "Datagrams available for connId=" << connId;
+  } 
 
   void onStreamWriteReady(quic::StreamId id, uint64_t maxToSend) noexcept
       override {
@@ -219,6 +223,8 @@ class EchoHandler : public quic::QuicSocket::ConnectionSetupCallback,
   std::shared_ptr<quic::QuicSocket> sock;
 
  private:
+  static int requestCnt;
+
   void echo(quic::StreamId id, StreamData& data) {
     if (!data.second) {
       // only echo when eof is present
@@ -233,6 +239,95 @@ class EchoHandler : public quic::QuicSocket::ConnectionSetupCallback,
       // echo is done, clear EOF
       data.second = false;
     }
+  }
+
+  void handleMP4Request(quic::StreamId id, StreamData& data) {
+
+    // 将接收到的数据转换为字符串（假设数据是包含路径的）
+    auto receivedData = data.first.move();
+    auto eof = data.second;
+    // 解析HTTP/1.1格式的receivedData
+    std::string httpData = receivedData->moveToFbString().toStdString();
+    size_t pos = 0;
+    size_t start = 0;
+    std::string filePath;
+    while((pos = httpData.find("\r\n\r\n", start)) != std::string::npos){
+        std::string requestData = httpData.substr(start, pos - start + 4);
+        start = pos + 4;
+        
+        std::istringstream iss(requestData);
+        std::string firstLine;
+        std::getline(iss, firstLine);
+        
+        std::string requestType;
+        std::istringstream issFirstLine(firstLine);
+        issFirstLine >> requestType;
+        
+        if (requestType != "GET") {
+            continue;
+        }
+
+        // 提取url
+        std::string url;
+        issFirstLine >> url;
+
+        const std::string prefix = "https://" + sock->getLocalAddress().getAddressStr() + "/";
+        if (url.find(prefix) != 0 || url.find(".txt") == std::string::npos) {
+            LOG(ERROR) << "Invalid request URL: " << url;
+            auto errorResponse = folly::IOBuf::copyBuffer("Invalid MP4 request");
+            sock->writeChain(id, std::move(errorResponse), true, nullptr);
+            continue;
+        }
+        
+        filePath = url.substr(prefix.size());
+        std::ifstream file(filePath, std::ios::binary);
+        if (!file) {
+            LOG(ERROR) << "Failed to open file: " << filePath;
+            auto errorResponse = folly::IOBuf::copyBuffer("File not found");
+            sock->writeChain(id, std::move(errorResponse), true, nullptr);
+            continue;
+        }
+
+        const size_t bufferSize = 1024;
+        char buffer[bufferSize];
+        std::streamsize toatlBytes = 0;
+        while (file) {
+            file.read(buffer, bufferSize);
+            std::streamsize bytesRead = file.gcount();
+            if (bytesRead > 0) {
+                auto fileChunk = folly::IOBuf::copyBuffer(buffer, bytesRead);
+                auto res = sock->writeChain(id, std::move(fileChunk), false, nullptr);
+                if (res.hasError()) {
+                    LOG(ERROR) << "Write error: " << toString(res.error());
+                    return;
+                }
+                toatlBytes += bytesRead;
+            }
+        }
+
+        auto eof = folly::IOBuf::create(0);
+        auto res = sock->writeChain(id, std::move(eof), false, nullptr);
+        if (res.hasError()) {
+            LOG(ERROR) << "Error sending EOF: " << toString(res.error());
+        }else{
+            //LOG(INFO) << "file download completed: " << filePath;
+            VLOG(4) << "Sent " << toatlBytes << " bytes of file data for request " << ++requestCnt;
+        }
+        
+    }
+    
+    if (eof) {
+        auto eof = folly::IOBuf::create(0);
+        auto res = sock->writeChain(id, std::move(eof), true, nullptr);
+        if (res.hasError()) {
+            LOG(ERROR) << "Error sending EOF: " << toString(res.error());
+        }else{
+            LOG(INFO) << "file download completed: " << filePath;
+        }
+    }
+
+    // 清除 EOF 标志
+    data.second = false;
   }
 
   void echoDg(std::vector<quic::ReadDatagram> datagrams) {
@@ -253,4 +348,7 @@ class EchoHandler : public quic::QuicSocket::ConnectionSetupCallback,
   std::map<quic::StreamGroupId, PerStreamData> streamGroupsData_;
   bool disableRtx_{false};
 };
-} // namespace quic::samples
+
+int DlwHandler::requestCnt = 0;  // 在类外初始化静态成员
+
+} // namespace quic::download

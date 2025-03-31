@@ -169,6 +169,14 @@ class ServerStreamHandler : public quic::QuicSocket::ConnectionSetupCallback,
     LOG(INFO) << "read available for stream id=" << id;
   }
 
+  void readAvailable(StreamId streamId, int64_t connId) noexcept {
+    LOG(INFO) << "TerfServer:" << connId << " readAvailable streamId=" << streamId;
+  }
+
+  void onMultiNewBidirectionalStream(int64_t connId, StreamId id) noexcept {
+    LOG(INFO) << "TerfServer:" << connId << " new bidirectional stream=" << id;
+  }
+
   void readError(quic::StreamId id, QuicError error) noexcept override {
     LOG(ERROR) << "Got read error on stream=" << id
                << " error=" << toString(error);

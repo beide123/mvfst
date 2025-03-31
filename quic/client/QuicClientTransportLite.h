@@ -423,4 +423,5 @@ class QuicClientTransportLite
   // Output buf/accessor to be used for continuous memory writes.
   std::unique_ptr<BufAccessor> bufAccessor_;
 };
+
 } // namespace quic

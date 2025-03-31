@@ -109,9 +109,9 @@ fi
 # have a tendency to freeze if we actually use all cores).
 set +x
 nproc=4
-if [ -z "$(hash nproc 2>&1)" ]; then
-    nproc=$(nproc)
-fi
+#if [ -z "$(hash nproc 2>&1)" ]; then
+#    nproc=$(nproc)
+#fi
 set -x
 
 function install_dependencies_linux() {

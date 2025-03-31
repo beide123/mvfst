@@ -109,4 +109,76 @@ class QuicClientTransport : public QuicTransportBase,
   const WrappedSocketObserverContainer wrappedObserverContainer_;
 };
 
+class ConnectionManager {
+ public:
+  ConnectionManager(uint64_t capacity) : capacity_(capacity) {}
+  // Add connection
+  void addConnection(int64_t connectionId, std::shared_ptr<QuicClientTransport> connection) {
+    if (connectionId > -1) {
+        if (connections_.size() >= capacity_) {
+            LOG(ERROR) << "ConnectionManager capacity is full";
+            return;
+        }
+        connections_[connectionId] = connection; // 更新索引
+    }else 
+        LOG(ERROR) << "ConnIdx is empty" ;
+  }
+
+  std::vector<int64_t> getAllConnectionIds() {
+    std::vector<int64_t> allConnectionIds;
+    for (const auto& pair : connections_) {
+      allConnectionIds.push_back(pair.first);
+    }
+    return allConnectionIds;
+  }
+
+  // Get connection
+  std::shared_ptr<QuicClientTransport> getConnection(int64_t& connectionId) {
+    auto it = connections_.find(connectionId);
+    if (it != connections_.end()) {
+      return it->second;
+    }
+    return nullptr; // Connection not exist
+  }
+
+  // Build clientStreams_ mapping
+  void buildClientStreamsMap(int64_t connectionId, StreamId stream_id) {
+    if (clientStreams_.find(connectionId) == clientStreams_.end()) {
+      clientStreams_[connectionId] = stream_id;
+    }else
+      LOG(INFO) << "Connection" << connectionId << "has already created stream" ;
+  }
+
+  StreamId getClientStream(int64_t connectionId){
+    auto it = clientStreams_.find(connectionId);
+    if (it != clientStreams_.end()) {
+      return it->second;
+    }
+    return StreamId(-1);
+  }
+
+  // Destroy connection
+  void removeConnection(int64_t connectionId) {
+    connections_.erase(connectionId);
+  }
+
+  std::pair<int64_t, std::shared_ptr<QuicClientTransport>> getBestConnection() {
+    if (connections_.empty()) {
+      return std::make_pair(int64_t(), nullptr);
+    }
+    unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
+    std::mt19937 gen(seed);
+    std::uniform_int_distribution<> dis(0, connections_.size() - 1);
+
+    auto it = connections_.begin();
+    std::advance(it, dis(gen));
+    return std::make_pair(it->first, it->second);
+  }
+
+ private:
+  uint64_t capacity_; 
+  std::unordered_map<int64_t, std::shared_ptr<QuicClientTransport>> connections_;
+  std::unordered_map<int64_t, StreamId> clientStreams_;
+};
+
 } // namespace quic

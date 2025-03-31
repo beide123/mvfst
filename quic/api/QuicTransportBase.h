@@ -47,6 +47,10 @@ class QuicTransportBase : public QuicSocket,
 
   Optional<ConnectionId> getClientConnectionId() const override;
 
+  void setClientConnIdx(int64_t idx) const override;
+
+  void setMultiPath(bool isMultiPath) const override;
+
   Optional<ConnectionId> getServerConnectionId() const override;
 
   Optional<ConnectionId> getClientChosenDestConnectionId() const override;

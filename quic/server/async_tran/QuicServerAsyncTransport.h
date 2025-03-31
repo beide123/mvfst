@@ -28,6 +28,7 @@ class QuicServerAsyncTransport : public QuicStreamAsyncTransport,
   // QuicSocket::ConnectionCallback
   //
   void onNewBidirectionalStream(StreamId id) noexcept override;
+  void onMultiNewBidirectionalStream(int64_t /*connId*/, StreamId /*id*/) noexcept override;
   void onNewUnidirectionalStream(StreamId id) noexcept override;
   void onStopSending(StreamId id, ApplicationErrorCode error) noexcept override;
   void onConnectionEnd() noexcept override;

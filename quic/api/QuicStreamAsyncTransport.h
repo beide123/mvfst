@@ -128,6 +128,7 @@ class QuicStreamAsyncTransport : public folly::AsyncTransport,
   // QucSocket::ReadCallback overrides
   //
   void readAvailable(quic::StreamId /*streamId*/) noexcept override;
+  void readAvailable(quic::StreamId /*streamId*/, int64_t /*connId*/) noexcept override;
   void readError(quic::StreamId /*streamId*/, QuicError error) noexcept
       override;
 

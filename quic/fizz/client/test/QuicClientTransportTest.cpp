@@ -1142,6 +1142,7 @@ TEST_F(QuicClientTransportTest, SocketClosedDuringOnTransportReady) {
 
     MOCK_METHOD(void, onFlowControlUpdate, (StreamId), (noexcept));
     MOCK_METHOD(void, onNewBidirectionalStream, (StreamId), (noexcept));
+    MOCK_METHOD(void, onMultiNewBidirectionalStream, (int64_t, StreamId), (noexcept));
     MOCK_METHOD(void, onNewUnidirectionalStream, (StreamId), (noexcept));
     MOCK_METHOD(
         void,

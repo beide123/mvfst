@@ -102,6 +102,10 @@ void TPerfClient::readAvailable(quic::StreamId streamId) noexcept {
   }
 }
 
+void TPerfClient::readAvailable(StreamId streamId, int64_t connId) noexcept {
+  LOG(INFO) << "TPerfClient:" << connId << " readAvailable streamId=" << streamId;
+}
+
 void TPerfClient::readError(
     quic::StreamId /*streamId*/,
     QuicError
@@ -114,6 +118,10 @@ void TPerfClient::readError(
 void TPerfClient::onNewBidirectionalStream(quic::StreamId id) noexcept {
   LOG(INFO) << "TPerfClient: new bidirectional stream=" << id;
   quicClient_->setReadCallback(id, this);
+}
+
+void TPerfClient::onMultiNewBidirectionalStream(int64_t connId, StreamId id) noexcept {
+  LOG(INFO) << "TPerfClient:" << connId << " new bidirectional stream=" << id;
 }
 
 void TPerfClient::onNewUnidirectionalStream(quic::StreamId id) noexcept {

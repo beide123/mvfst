@@ -35,6 +35,8 @@ constexpr uint64_t kInitialSequenceNumber = 0x0;
 enum class ConnectionIdVersion : uint8_t { V0 = 0, V1 = 1, V2 = 2, V3 = 3 };
 
 struct ConnectionId {
+  int64_t idx = -1;
+
   uint8_t* data();
 
   const uint8_t* data() const;

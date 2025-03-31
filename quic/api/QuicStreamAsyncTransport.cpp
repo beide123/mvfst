@@ -323,6 +323,13 @@ void QuicStreamAsyncTransport::readAvailable(
   sock_->getEventBase()->runInLoop(this, true);
 }
 
+void QuicStreamAsyncTransport::readAvailable(
+    quic::StreamId /*streamId*/, int64_t /*connId*/) noexcept {
+  // defer the actual read until the loop callback.  This prevents possible
+  // tail recursion with readAvailable -> setReadCallback -> readAvailable
+  sock_->getEventBase()->runInLoop(this, true);
+}
+
 void QuicStreamAsyncTransport::readError(
     quic::StreamId /*streamId*/,
     QuicError error) noexcept {

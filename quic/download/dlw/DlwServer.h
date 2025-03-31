@@ -11,17 +11,17 @@
 #include <glog/logging.h>
 
 #include <quic/common/test/TestUtils.h>
-#include <quic/samples/echo/EchoHandler.h>
-#include <quic/samples/echo/LogQuicStats.h>
+#include <quic/download/dlw/EchoHandler.h>
+#include <quic/download/dlw/LogQuicStats.h>
 #include <quic/server/QuicServer.h>
 #include <quic/server/QuicServerTransport.h>
 #include <quic/server/QuicSharedUDPSocketFactory.h>
 
-namespace quic::samples {
+namespace quic::download {
 
-class EchoServerTransportFactory : public quic::QuicServerTransportFactory {
+class DlwServerTransportFac : public quic::QuicServerTransportFactory {
  public:
-  ~EchoServerTransportFactory() override {
+  ~DlwServerTransportFac() override {
     draining_ = true;
     echoHandlers_.withWLock([](auto& echoHandlers) {
       while (!echoHandlers.empty()) {
@@ -37,7 +37,7 @@ class EchoServerTransportFactory : public quic::QuicServerTransportFactory {
     });
   }
 
-  explicit EchoServerTransportFactory(
+  explicit DlwServerTransportFac(
       bool useDatagrams = false,
       bool disableRtx = false)
       : useDatagrams_(useDatagrams), disableRtx_(disableRtx) {}
@@ -54,7 +54,7 @@ class EchoServerTransportFactory : public quic::QuicServerTransportFactory {
       return nullptr;
     }
     auto echoHandler =
-        std::make_unique<EchoHandler>(evb, useDatagrams_, disableRtx_);
+        std::make_unique<DlwHandler>(evb, useDatagrams_, disableRtx_);
     auto transport = quic::QuicServerTransport::make(
         evb, std::move(sock), echoHandler.get(), echoHandler.get(), ctx);
     echoHandler->setQuicSocket(transport);
@@ -66,14 +66,14 @@ class EchoServerTransportFactory : public quic::QuicServerTransportFactory {
 
  private:
   bool useDatagrams_;
-  folly::Synchronized<std::vector<std::unique_ptr<EchoHandler>>> echoHandlers_;
+  folly::Synchronized<std::vector<std::unique_ptr<DlwHandler>>> echoHandlers_;
   bool draining_{false};
   bool disableRtx_{false};
 };
 
-class EchoServer {
+class DlwServer {
  public:
-  explicit EchoServer(
+  explicit DlwServer(
       std::vector<std::string> alpns,
       const std::string& host = "::1",
       uint16_t port = 6666,
@@ -87,6 +87,7 @@ class EchoServer {
     settings.datagramConfig.enabled = useDatagrams;
     settings.selfActiveConnectionIdLimit = activeConnIdLimit;
     settings.disableMigration = !enableMigration;
+
     if (enableStreamGroups) {
       settings.notifyOnNewStreamsExplicitly = true;
       settings.advertisedMaxStreamGroups = 1024;
@@ -96,21 +97,19 @@ class EchoServer {
         LOG(FATAL) << "disable_rtx requires use_stream_groups to be enabled";
       }
     }
-
     server_ = QuicServer::createQuicServer(std::move(settings));
 
     server_->setQuicServerTransportFactory(
-        std::make_unique<EchoServerTransportFactory>(useDatagrams, disableRtx));
+        std::make_unique<DlwServerTransportFac>(useDatagrams, disableRtx));
     server_->setTransportStatsCallbackFactory(
-        std::make_unique<LogQuicStatsFactory>());
+        std::make_unique<LogQuicStatsFac>());
     auto serverCtx = quic::test::createServerCtx();
     serverCtx->setClock(std::make_shared<fizz::SystemClock>());
     serverCtx->setSupportedAlpns(std::move(alpns_));
     server_->setFizzContext(serverCtx);
-    
   }
 
-  ~EchoServer() {
+  ~DlwServer() {
     server_->shutdown();
   }
 

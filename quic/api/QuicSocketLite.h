@@ -138,6 +138,12 @@ class QuicSocketLite {
     virtual void onNewBidirectionalStream(StreamId id) noexcept = 0;
 
     /**
+     * Invoked when the peer creates a new bidirectional stream in Multipath.  The most
+     * common flow would be to set the ReadCallback from here
+     */
+    virtual void onMultiNewBidirectionalStream(int64_t connId, StreamId id) noexcept = 0;
+
+    /**
      * Invoked when the peer creates a new bidirectional stream group.
      */
     virtual void onNewBidirectionalStreamGroup(StreamGroupId) noexcept {}
@@ -532,6 +538,8 @@ class QuicSocketLite {
      * Notifies the DatagramCallback that datagrams are available for read.
      */
     virtual void onDatagramsAvailable() noexcept = 0;
+    virtual void onDatagramsAvailable(int64_t connId) noexcept = 0;
+
   };
 
   /**

@@ -95,6 +95,23 @@ Optional<ConnectionId> QuicTransportBase::getClientConnectionId() const {
   return conn_->clientConnectionId;
 }
 
+void QuicTransportBase::setClientConnIdx(int64_t idx) const {
+  if (conn_->clientConnectionId.has_value()) {
+      // 如果 Optional 对象包含值，则直接设置 idx 值
+      if(conn_->clientConnectionId.value().idx < 0){
+        conn_->clientConnectionId.value().idx = idx;
+      }else
+        LOG(ERROR) << "ConnectionIdx already has value";
+  } else {
+      LOG(ERROR) << "ConnectionId is empty";
+      throw std::runtime_error("ConnectionId is empty");
+  }
+}
+
+void QuicTransportBase::setMultiPath(bool isMultiPath) const {
+  conn_->isMultiPath = isMultiPath;
+}
+
 Optional<ConnectionId> QuicTransportBase::getServerConnectionId() const {
   return conn_->serverConnectionId;
 }

@@ -16,6 +16,7 @@
 #include <quic/state/QuicPacingFunctions.h>
 #include <quic/state/QuicStreamFunctions.h>
 #include <quic/state/stream/StreamSendHandlers.h>
+#include <quic/codec/QuicConnectionId.h>
 #include <sstream>
 
 namespace {
@@ -2517,14 +2518,22 @@ void QuicTransportBaseLite::invokeReadDataAndCallbacks(
       VLOG(10) << "invoking read callbacks on stream=" << streamId << " "
                << *this;
       if (!stream->groupId) {
-        readCb->readAvailable(streamId);
+        if(self->conn_->isMultiPath){
+          readCb->readAvailable(streamId, conn_->clientConnectionId.value().idx);
+        }else{
+          readCb->readAvailable(streamId);
+        }
       } else {
         readCb->readAvailableWithGroup(streamId, *stream->groupId);
       }
     }
   }
   if (self->datagramCallback_ && !conn_->datagramState.readBuffer.empty()) {
-    self->datagramCallback_->onDatagramsAvailable();
+    if(conn_->isMultiPath){
+      self->datagramCallback_->onDatagramsAvailable(conn_->clientConnectionId.value().idx);
+    }else{
+      self->datagramCallback_->onDatagramsAvailable();
+    }
   }
 }
 

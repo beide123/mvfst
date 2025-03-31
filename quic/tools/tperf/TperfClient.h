@@ -44,11 +44,13 @@ class TPerfClient : public quic::QuicSocket::ConnectionSetupCallback,
   virtual void callbackCanceled() noexcept override {}
 
   void readAvailable(quic::StreamId streamId) noexcept override;
+  void readAvailable(quic::StreamId streamId, int64_t connId) noexcept;
   void readError(
       quic::StreamId /*streamId*/,
       QuicError
       /*error*/) noexcept override;
   void onNewBidirectionalStream(quic::StreamId id) noexcept override;
+  void onMultiNewBidirectionalStream(int64_t connId, StreamId id) noexcept;
   void onNewUnidirectionalStream(quic::StreamId id) noexcept override;
   void onTransportReady() noexcept override;
   void onStopSending(

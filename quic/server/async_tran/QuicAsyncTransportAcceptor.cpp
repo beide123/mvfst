@@ -57,6 +57,11 @@ class ServerTransportConnectionSetupCallback
   void onNewBidirectionalStream(StreamId /*id*/) noexcept override {
     CHECK(false);
   }
+
+  void onMultiNewBidirectionalStream(int64_t /*connId*/, StreamId /*id*/) noexcept override {
+    CHECK(false);
+  }
+
   void onNewUnidirectionalStream(StreamId /*id*/) noexcept override {
     CHECK(false);
   }
