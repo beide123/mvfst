@@ -108,7 +108,7 @@ fi
 # just use the default of 4 (e.g., some desktop/laptop OSs
 # have a tendency to freeze if we actually use all cores).
 set +x
-nproc=4
+nproc=8
 #if [ -z "$(hash nproc 2>&1)" ]; then
 #    nproc=$(nproc)
 #fi

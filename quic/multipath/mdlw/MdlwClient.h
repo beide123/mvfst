@@ -424,7 +424,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     startDone_.wait();
 
     // loop until Ctrl+D
-    generateRequests(10);
+    generateRequests(1500000);
 
     LOG(INFO) << "EchoClient stopping client";
   }
