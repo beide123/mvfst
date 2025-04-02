@@ -88,8 +88,8 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
 
     std::string filePath;
 
-    if (recvOffsets_.find(streamId) == recvOffsets_.end()) {
-        recvOffsets_[streamId] = 0; // 初始化
+    if (recvOffsets_[connId].find(streamId) == recvOffsets_[connId].end()) {
+        recvOffsets_[connId][streamId] = 0; // 初始化
         // 创建文件
         filePath = "./received_data_" + std::to_string(connId) + ".txt";
         std::ofstream file(filePath, std::ios::binary);
@@ -120,7 +120,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
 
             file.close();
             // 更新偏移量
-            recvOffsets_[streamId] += written;
+            recvOffsets_[connId][streamId] += written;
         
             //LOG(INFO) << "Stream " << streamId << ": Successfully wrote " << written << " bytes.";
             /*LOG(INFO) << "Client received data on stream=" << streamId
@@ -276,17 +276,27 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
       client->setReadCallback(streamId, this);
       LOG(INFO) << "Client " << connId << " Created stream ID: " << streamId;
       connManager_->buildClientStreamsMap(connId, streamId);
+      // Send an activation request to the server for each connection to establish the stream
+      std::string acivRequest = "ACTIVATE\r\n\r\n";
+      client->getEventBase()->runInEventBaseThread([this, streamId, client, acivRequest = std::move(acivRequest)]() {
+          auto req = folly::IOBuf::copyBuffer(acivRequest);
+          auto res = client->writeChain(streamId, std::move(req), false, nullptr);
+          if (res.hasError()) {
+            LOG(ERROR) << "Error sending activation request: " << toString(res.error());
+          }
+      });
     }
     
     auto start = std::chrono::steady_clock::now();
+
+    std::string url = "https://" + host_ + "/BBRtestfile_1000M"; //+ std::to_string(i);
+    std::string request = "GET " + url + " HTTP/1.1\r\nHost: " + host_ + "\r\n\r\n";
     
     while (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count() < duration_) {
         size_t batchStart = i;
        
         while (i < numRequests && i < batchStart + 1000) {
             // 构造请求内容
-            std::string url = "https://" + host_ + "/dlw_1m.txt"; //+ std::to_string(i);
-            std::string request = "GET " + url + " HTTP/1.1\r\nHost: " + host_ + "\r\n\r\n";
             auto client_pair = connManager_->getBestConnection();
             auto connId = client_pair.first;
             auto client = client_pair.second;
@@ -314,21 +324,30 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     }
   }
 
-  size_t calculateThroughput(std::chrono::steady_clock::time_point& lastTime, size_t& lastTotalBytes) {
+  size_t calculateThroughput(std::chrono::steady_clock::time_point& lastTime, size_t& lastTotalBytes, size_t& lastTotalBytes_conn0, size_t& lastTotalBytes_conn1) {
     auto currentTime = std::chrono::steady_clock::now();
-    size_t currentTotalBytes = 0;
+    size_t currentTotalBytes_conn0 = 0;
+    size_t currentTotalBytes_conn1 = 0;
 
-    currentTotalBytes += recvOffsets_[0];
+    currentTotalBytes_conn0 += recvOffsets_[0][0];
+    currentTotalBytes_conn1 += recvOffsets_[1][0];
+    size_t currentTotalBytes = currentTotalBytes_conn0 + currentTotalBytes_conn1;
 
     // 计算时间差
     std::chrono::duration<double> elapsed = currentTime - lastTime;
 
     // 每秒打印吞吐量
     if (elapsed.count() >= 1.0) {
-        size_t throughput = (currentTotalBytes - lastTotalBytes) * 8 / 1024 / 1024; // 当前秒的吞吐量，换算成Mbps
-        LOG(INFO) << "The Download Throughput: " << throughput << " Mbps";
+        float throughput = (float)(currentTotalBytes - lastTotalBytes) * 8 / 1024 / 1024; // 当前秒的吞吐量，换算成Mbps
+        float throughput_conn0 = (float)(currentTotalBytes_conn0 - lastTotalBytes_conn0) * 8 / 1024 / 1024; // 当前秒的吞吐量，换算成Mbps
+        float throughput_conn1 = (float)(currentTotalBytes_conn1 - lastTotalBytes_conn1) * 8 / 1024 / 1024; // 当前秒的吞吐量，换算成Mbps
+        LOG(INFO) << "The Download Throughput: " << throughput << " Mbps"
+                  << " conn0: " << throughput_conn0 << " Mbps"
+                  << " conn1: " << throughput_conn1 << " Mbps";
         // 更新上一次的字节数和时间
         lastTotalBytes = currentTotalBytes;
+        lastTotalBytes_conn0 = currentTotalBytes_conn0;
+        lastTotalBytes_conn1 = currentTotalBytes_conn1;
         lastTime = currentTime;
     }
     return 0; 
@@ -414,9 +433,11 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     std::thread([this]() {
         std::chrono::steady_clock::time_point lastTime = std::chrono::steady_clock::now();
         size_t lastTotalBytes = 0;
+        size_t lastTotalBytes_conn0 = 0;
+        size_t lastTotalBytes_conn1 = 0;
         while (running_) {
             // 在这里输出性能指标，例如吞吐量
-            calculateThroughput(lastTime, lastTotalBytes);
+            calculateThroughput(lastTime, lastTotalBytes, lastTotalBytes_conn0, lastTotalBytes_conn1);
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }).detach();
@@ -424,7 +445,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     startDone_.wait();
 
     // loop until Ctrl+D
-    generateRequests(1500000);
+    generateRequests(1);
 
     LOG(INFO) << "EchoClient stopping client";
   }
@@ -447,9 +468,9 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
       LOG(ERROR) << "EchoClient writeChain error=" << uint32_t(res.error());
     } else {
       auto str = message->to<std::string>();
-      LOG(INFO) << "EchoClient " << connId << " wrote idx = \"" << idx << str << "\""
+      /*LOG(INFO) << "EchoClient " << connId << " wrote idx = \"" << idx << str << "\""
                 << ", len=" << str.size() << " on stream=" << id
-                << ", pendingOutput_ queue length=" << pendingOutputs_[connId][id].chainLength();
+                << ", pendingOutput_ queue length=" << pendingOutputs_[connId][id].chainLength();*/
       // sent whole message
       pendingOutputs_[connId].erase(id);
     }
@@ -494,7 +515,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
   bool enableStreamGroups_;
   bool running_ = true;
   std::map<uint64_t, std::map<quic::StreamId, BufQueue>> pendingOutputs_;
-  std::map<quic::StreamId, uint64_t> recvOffsets_;
+  std::map<uint64_t, std::map<quic::StreamId, uint64_t>> recvOffsets_;
   folly::fibers::Baton startDone_;
   std::array<StreamGroupId, kNumTestStreamGroups> streamGroups_;
   size_t curGroupIdIdx_{0};

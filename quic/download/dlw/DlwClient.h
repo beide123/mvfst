@@ -68,8 +68,7 @@ class DlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
         alpns_(std::move(alpns)),
         connectOnly_(connectOnly),
         clientCertPath_(clientCertPath),
-        clientKeyPath_(clientKeyPath),
-        connManager_(10) {}
+        clientKeyPath_(clientKeyPath){}
 
   void readAvailable(quic::StreamId streamId) noexcept override {
     auto readData = quicClient_->read(streamId, 0);
@@ -79,71 +78,41 @@ class DlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     }
     bool eof = readData->second;
     auto copy = readData->first.get();
-
-    size_t dataLength = copy->length();
-
+    size_t totalReceivedBytes = 0;
     std::string filePath;
-
     if (recvOffsets_.find(streamId) == recvOffsets_.end()) {
-        recvOffsets_[streamId] = 0; // 初始化
-        // 创建文件
-        filePath = "./received_data_" + std::to_string(fileCounter++) + ".txt";
-        std::ofstream file(filePath, std::ios::binary);
-        if (!file) {
-            LOG(ERROR) << "Failed to open file for writing: " << filePath;
-            return;
-        }
-        file.close();
+      recvOffsets_[streamId] = 0;
+      filePath = "./received_data_stream" + std::to_string(streamId) + ".txt";
+      std::ofstream file(filePath, std::ios::binary);
+      if (!file) {
+        LOG(ERROR) << "Failed to create file: " << filePath;
+        return;
+      }
+      //fileHandles_[streamId] = std::move(file);
+      LOG(INFO) << "Created new file: " << filePath << " for stream " << streamId;
     }
 
     auto current = copy;
-    while (current){
-        size_t dataLength = current->length();
-
-        if(dataLength > 0){
-            // 将数据追加到文件中
-            // **遍历整个 IOBuf 链，逐块写入数据**
-            size_t written = 0;
-            /*filePath = "./received_data_" + std::to_string(fileCounter - 1) + ".txt";
-            std::ofstream file(filePath, std::ios::binary | std::ios::app);
-            if (!file) {
-              LOG(ERROR) << "Failed to open file for appending: " << filePath;
-              return;
-            }
-            
-            file.write(reinterpret_cast<const char*>(current->data()), dataLength);*/
-            written += dataLength;
-
-            //file.close();
-            // 更新偏移量
-            recvOffsets_[streamId] += written;
-        
-            //LOG(INFO) << "Stream " << streamId << ": Successfully wrote " << written << " bytes.";
-            /*LOG(INFO) << "Client received data on stream=" << streamId
-                      << ", total received=" << recvOffsets_[streamId] << " bytes";*/
-            
-        }else{
-            // 创建新文件
-            filePath = "./received_data_" + std::to_string(fileCounter++) + "_new.txt";
-            std::ofstream newFile(filePath, std::ios::binary);
-            if (!newFile) {
-                LOG(ERROR) << "Failed to open new file for writing: " << filePath;
-                return;
-            }
-            newFile.close();
-        }
-
-        if (current->next() == copy) { // 避免循环链
-            break;
-        }
-        
-        current = current->next();
-
+    std::ofstream file(filePath, std::ios::binary | std::ios::app);
+    while (current) {
+      size_t dataLength = current->length();
+      if(dataLength > 0){
+        file.write(reinterpret_cast<const char*>(current->data()), dataLength);
+        recvOffsets_[streamId] += dataLength;
+        totalReceivedBytes += dataLength;
+        //LOG(INFO) << "Received data from stream " << streamId << " with length " << totalReceivedBytes;
+      }
+      if (current->next() == copy) { // 避免循环链
+        break;
+      }  
+      current = current->next();
     }
-    
-    // 如果接收到 EOF，关闭当前文件并创建新文件
+    file.close();
+
     if(eof){
-        LOG(INFO) << "Stream " << streamId << " has reached EOF.";
+      LOG(INFO) << "Stream " << streamId << " has reached EOF.";
+      fileHandles_[streamId].close();
+      fileHandles_.erase(streamId);
     }
   }
 
@@ -305,7 +274,7 @@ class DlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
         size_t batchStart = i;
         while (i < numRequests && i < batchStart + 1000) {
             // 构造请求内容
-            std::string url = "https://127.0.0.1/dlw_10k.txt"; //+ std::to_string(i);
+            std::string url = "https://127.0.0.1/CHUNK_9999K.mp4"; //+ std::to_string(i);
             std::string request = "GET " + url + " HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
             //LOG(INFO) << "Submitting task: index=" << i;
             // 将发送任务交给 EventBaseThread
@@ -377,6 +346,16 @@ class DlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
         settings.disableMigration = !enableMigration_;
 
         settings.shouldUseRecvmmsgForBatchRecv = true;
+
+        /*Test BBR2*/
+        settings.pacingEnabled = true;
+        settings.pacingTickInterval = 200us;
+        settings.defaultCongestionController = CongestionControlType::BBR2;
+        settings.experimentalPacer = true;  // 使用实验性的 pacing 实现
+        settings.defaultRttFactor = {1, 1};
+        settings.startupRttFactor = {1, 1};
+
+        settings.autotuneReceiveConnFlowControl = true;
         
         if (enableStreamGroups_) {
           settings.notifyOnNewStreamsExplicitly = true;
@@ -451,7 +430,7 @@ class DlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     };
 
     // loop until Ctrl+D
-    generateRequests(150000);
+    generateRequests(1);
 
     LOG(INFO) << "EchoClient stopping client";
   }
@@ -530,6 +509,6 @@ class DlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
   std::string clientKeyPath_;
   folly::Synchronized<std::queue<std::string>> taskQueue_;
   folly::EventBase fEvb_;
-  ConnectionManager connManager_;
+  std::map<quic::StreamId, std::ofstream> fileHandles_;
 };
 } // namespace quic::samples

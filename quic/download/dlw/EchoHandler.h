@@ -102,7 +102,7 @@ class DlwHandler : public quic::QuicSocket::ConnectionSetupCallback,
   }
 
   void readAvailable(quic::StreamId id) noexcept override {
-    LOG(INFO) << "read available for stream id=" << id;
+    //LOG(INFO) << "read available for stream id=" << id;
 
     auto res = sock->read(id, 0);
     if (res.hasError()) {
@@ -125,7 +125,7 @@ class DlwHandler : public quic::QuicSocket::ConnectionSetupCallback,
     if (dataLen > 0) {
       //echo(id, input_[id]);
       handleMP4Request(id, input_[id]);
-      LOG(INFO) << "uninstalling read callback";
+      //LOG(INFO) << "uninstalling read callback";
       sock->setReadCallback(id, this);
     }
   }
@@ -251,6 +251,12 @@ class DlwHandler : public quic::QuicSocket::ConnectionSetupCallback,
     size_t pos = 0;
     size_t start = 0;
     std::string filePath;
+    
+    if(firstRequest_){
+        firstRequest_ = false;
+        startThroughputThread();
+    }
+
     while((pos = httpData.find("\r\n\r\n", start)) != std::string::npos){
         std::string requestData = httpData.substr(start, pos - start + 4);
         start = pos + 4;
@@ -272,7 +278,7 @@ class DlwHandler : public quic::QuicSocket::ConnectionSetupCallback,
         issFirstLine >> url;
 
         const std::string prefix = "https://127.0.0.1/";
-        if (url.find(prefix) != 0 || url.find(".txt") == std::string::npos) {
+        if (url.find(prefix) != 0 || url.find(".mp4") == std::string::npos) {
             LOG(ERROR) << "Invalid request URL: " << url;
             auto errorResponse = folly::IOBuf::copyBuffer("Invalid MP4 request");
             sock->writeChain(id, std::move(errorResponse), true, nullptr);
@@ -288,20 +294,32 @@ class DlwHandler : public quic::QuicSocket::ConnectionSetupCallback,
             continue;
         }
 
-        const size_t bufferSize = 1024;
-        char buffer[bufferSize];
+        const size_t bufferSize = 64 * 1024;
+        std::vector<char> buffer(bufferSize);
+
+        auto fileChunk = folly::IOBufQueue();
+
         std::streamsize toatlBytes = 0;
         while (file) {
-            file.read(buffer, bufferSize);
+            file.read(buffer.data(), bufferSize);
             std::streamsize bytesRead = file.gcount();
             if (bytesRead > 0) {
-                auto fileChunk = folly::IOBuf::copyBuffer(buffer, bytesRead);
-                auto res = sock->writeChain(id, std::move(fileChunk), false, nullptr);
+                fileChunk.append(folly::IOBuf::copyBuffer(buffer.data(), bytesRead));
+                auto res = sock->writeChain(id, fileChunk.move(), false, nullptr);
                 if (res.hasError()) {
                     LOG(ERROR) << "Write error: " << toString(res.error());
                     return;
                 }
                 toatlBytes += bytesRead;
+                currentBytes_ += bytesRead;
+            }
+        }
+
+        if (!fileChunk.empty()) {
+            auto res = sock->writeChain(id, fileChunk.move(), false, nullptr);
+            if (res.hasError()) {
+                LOG(ERROR) << "Write error: " << toString(res.error());
+                return;
             }
         }
 
@@ -342,11 +360,35 @@ class DlwHandler : public quic::QuicSocket::ConnectionSetupCallback,
     }
   }
 
+  void calculateThroughput() {
+    while (true) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      auto throughput = (currentBytes_ - previousBytes_) * 8 / 1024 / 1024; // in MB
+      LOG(INFO) << "Current throughput: " << throughput << " MB/s";
+      previousBytes_ = currentBytes_;
+    }
+  }
+
+  std::thread throughputThread;
+
+  void startThroughputThread() {
+    throughputThread = std::thread(&DlwHandler::calculateThroughput, this);
+  }
+
+  void stopThroughputThread() {
+    if (throughputThread.joinable()) {
+      throughputThread.join();
+    }
+  }
+
   bool useDatagrams_;
   using PerStreamData = std::map<quic::StreamId, StreamData>;
   PerStreamData input_;
   std::map<quic::StreamGroupId, PerStreamData> streamGroupsData_;
   bool disableRtx_{false};
+  bool firstRequest_{true};
+  std::streamsize currentBytes_{0};
+  std::streamsize previousBytes_{0};
 };
 
 int DlwHandler::requestCnt = 0;  // 在类外初始化静态成员

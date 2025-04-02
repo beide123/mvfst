@@ -17,7 +17,7 @@
 
 DEFINE_string(host, "::1", "Echo server hostname/IP");
 DEFINE_int32(port, 6666, "Echo server port");
-DEFINE_int32(dura, 10, "client running duration(s)");
+DEFINE_int32(dura, 60, "client running duration(s)");
 DEFINE_uint32(
     client_timer_ms,
     1,

@@ -88,6 +88,17 @@ class DlwServer {
     settings.selfActiveConnectionIdLimit = activeConnIdLimit;
     settings.disableMigration = !enableMigration;
 
+    settings.autotuneReceiveConnFlowControl = true;
+    settings.shouldUseRecvmmsgForBatchRecv = true;
+
+    /*Test BBR2*/
+    settings.pacingEnabled = true;
+    settings.pacingTickInterval = 200us;
+    settings.defaultCongestionController = CongestionControlType::BBR2;
+    settings.experimentalPacer = true;  // 使用实验性的 pacing 实现
+    settings.defaultRttFactor = {1, 1};
+    settings.startupRttFactor = {1, 1};
+
     if (enableStreamGroups) {
       settings.notifyOnNewStreamsExplicitly = true;
       settings.advertisedMaxStreamGroups = 1024;

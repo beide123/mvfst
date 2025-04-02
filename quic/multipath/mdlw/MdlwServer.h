@@ -37,6 +37,11 @@ class DlwServerTransportFac : public quic::QuicServerTransportFactory {
     });
   }
 
+  std::shared_ptr<folly::Synchronized<std::vector<std::unique_ptr<DlwHandler>>>> 
+  getHandlers() {
+    return std::make_shared<folly::Synchronized<std::vector<std::unique_ptr<DlwHandler>>>>(std::move(echoHandlers_));
+  }
+
   explicit DlwServerTransportFac(
       bool useDatagrams = false,
       bool disableRtx = false)
@@ -58,6 +63,7 @@ class DlwServerTransportFac : public quic::QuicServerTransportFactory {
     auto transport = quic::QuicServerTransport::make(
         evb, std::move(sock), echoHandler.get(), echoHandler.get(), ctx);
     echoHandler->setQuicSocket(transport);
+    echoHandler->setHandlers(&echoHandlers_);
     echoHandlers_.withWLock([&](auto& echoHandlers) {
       echoHandlers.push_back(std::move(echoHandler));
     });
