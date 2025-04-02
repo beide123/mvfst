@@ -332,11 +332,17 @@ class DlwHandler : public quic::QuicSocket::ConnectionSetupCallback,
                     auto fileChunk = folly::IOBuf::copyBuffer(buffer, bytesRead);
                     auto handler = getAvailableHandlers();
                     auto dis_sock = handler->sock;
+                    auto start_time = std::chrono::steady_clock::now();
                     auto res = dis_sock->writeChain(id, std::move(fileChunk), false, nullptr);
-                    if (res.hasError()) {
+                    while(res.hasError()) {
                         LOG(INFO) << "Writing file chunk to " << dis_sock->getPeerAddress().describe();
                         LOG(ERROR) << "Write error: " << toString(res.error());
-                        return;
+                        res = sock->writeChain(id, std::move(fileChunk), false, nullptr);
+                        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_time);
+                        if (elapsed.count() >= 2) {
+                            LOG(ERROR) << "Timeout: failed to write file chunk after 2 seconds";
+                            return; // Exit the loop if timeout
+                        }
                     }
                     toatlBytes += bytesRead;
                     currentBytes_ += bytesRead;

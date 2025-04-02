@@ -341,9 +341,9 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
         float throughput = (float)(currentTotalBytes - lastTotalBytes) * 8 / 1024 / 1024; // 当前秒的吞吐量，换算成Mbps
         float throughput_conn0 = (float)(currentTotalBytes_conn0 - lastTotalBytes_conn0) * 8 / 1024 / 1024; // 当前秒的吞吐量，换算成Mbps
         float throughput_conn1 = (float)(currentTotalBytes_conn1 - lastTotalBytes_conn1) * 8 / 1024 / 1024; // 当前秒的吞吐量，换算成Mbps
-        LOG(INFO) << "The Download Throughput: " << throughput << " Mbps"
-                  << " conn0: " << throughput_conn0 << " Mbps"
-                  << " conn1: " << throughput_conn1 << " Mbps";
+        LOG(INFO) << "The Download Throughput: " << throughput << " Mbps\n"
+                  << " -----conn0: " << throughput_conn0 << " Mbps\n"
+                  << " -----conn1: " << throughput_conn1 << " Mbps\n";
         // 更新上一次的字节数和时间
         lastTotalBytes = currentTotalBytes;
         lastTotalBytes_conn0 = currentTotalBytes_conn0;
