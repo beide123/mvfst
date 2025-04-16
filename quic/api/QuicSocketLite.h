@@ -15,6 +15,7 @@
 #include <quic/common/udpsocket/QuicAsyncUDPSocket.h>
 #include <quic/handshake/TransportParameters.h>
 #include <quic/state/StateData.h>
+#include <folly/io/IOBuf.h>
 
 namespace quic {
 
@@ -75,6 +76,65 @@ class QuicSocketLite {
     bool usedZeroRtt{false};
     // State from congestion control module, if one is installed.
     Optional<CongestionController::State> maybeCCState;
+  };
+
+  typedef struct ChunkWithSequenceData {
+      uint64_t sequenceNumber;
+      size_t total;
+      size_t offset;
+      std::shared_ptr<char> data;
+
+      ChunkWithSequenceData(uint64_t sequenceNumber, size_t total, size_t offset, std::shared_ptr<char> data) : 
+        sequenceNumber(sequenceNumber), 
+        total(total), 
+        offset(offset), 
+        data(data) 
+      {
+
+      }
+
+      ChunkWithSequenceData(const ChunkWithSequenceData& other)
+        : sequenceNumber(other.sequenceNumber),
+          total(other.total),
+          offset(other.offset) {
+        if (other.data) {
+          data = std::make_shared<char>(total);
+          memcpy(data.get(), other.data.get(), total);
+        } else {
+          data = nullptr;
+        }
+      }
+
+      // 复制构造函数
+      ChunkWithSequenceData& operator=(const ChunkWithSequenceData& other) {
+        if (this != &other) {
+          sequenceNumber = other.sequenceNumber;
+          offset = other.offset;
+          total = other.total;
+
+          if (other.data) {
+            data = std::make_shared<char>(total);
+            memcpy(data.get(), other.data.get(), total);
+          } else {
+            data = nullptr;
+          }
+        }
+        return *this;
+      }
+      
+      ~ChunkWithSequenceData() {
+        data = nullptr;
+      }
+      
+  } ChunkData;
+
+  class ChunkWithSequence {
+   public:
+
+    virtual ~ChunkWithSequence() = default;
+
+   private:
+    ChunkData data_; 
   };
 
   /**

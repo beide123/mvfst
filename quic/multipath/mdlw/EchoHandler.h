@@ -323,21 +323,42 @@ class DlwHandler : public quic::QuicSocket::ConnectionSetupCallback,
             }
 
             const size_t bufferSize = 1024;
-            char buffer[bufferSize];
+            uint64_t sequenceNumber = 0;
+            
+            std::vector<char> buffer(bufferSize);
+           
+            size_t headerSize = strlen("Frame") + sizeof(uint64_t) + sizeof(size_t);
+
             std::streamsize toatlBytes = 0;
+            
+
             while (file) {
-                file.read(buffer, bufferSize);
+               
+                char* rspbuf = new char[headerSize + bufferSize];
+
+                memcpy(rspbuf, "FRAME", strlen("FRAME"));
+                memcpy(rspbuf + strlen("FRAME"), &sequenceNumber, sizeof(uint64_t));
+
+                // 复制偏移量
+                file.read(rspbuf + headerSize, bufferSize);
                 std::streamsize bytesRead = file.gcount();
+
+                memcpy(rspbuf + strlen("FRAME") + sizeof(sequenceNumber), &bytesRead, sizeof(size_t));
+
+                auto rsp = folly::IOBuf::copyBuffer(rspbuf, headerSize + bytesRead);
+                
                 if (bytesRead > 0) {
-                    auto fileChunk = folly::IOBuf::copyBuffer(buffer, bytesRead);
-                    auto handler = getAvailableHandlers();
-                    auto dis_sock = handler->sock;
+                    auto dis_sock = getAvailableHandlers()->sock;
                     auto start_time = std::chrono::steady_clock::now();
-                    auto res = dis_sock->writeChain(id, std::move(fileChunk), false, nullptr);
+                    VLOG(5) << "Sequence Number: " << *reinterpret_cast<const uint64_t*>(rspbuf + strlen("FRAME")) 
+                    << "Offset: " << *reinterpret_cast<const size_t*>(rspbuf + strlen("FRAME") + sizeof(uint64_t));
+                    
+                    auto res = dis_sock->writeChain(id, std::move(rsp), false, nullptr);
                     while(res.hasError()) {
                         LOG(INFO) << "Writing file chunk to " << dis_sock->getPeerAddress().describe();
                         LOG(ERROR) << "Write error: " << toString(res.error());
-                        res = sock->writeChain(id, std::move(fileChunk), false, nullptr);
+                        auto rw = folly::IOBuf::copyBuffer(rspbuf, headerSize + bytesRead);
+                        res = sock->writeChain(id, std::move(rw), false, nullptr);
                         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_time);
                         if (elapsed.count() >= 2) {
                             LOG(ERROR) << "Timeout: failed to write file chunk after 2 seconds";
@@ -346,19 +367,21 @@ class DlwHandler : public quic::QuicSocket::ConnectionSetupCallback,
                     }
                     toatlBytes += bytesRead;
                     currentBytes_ += bytesRead;
+                    sequenceNumber++;
                 }
             }
 
             LOG(INFO) << " file send totalBytes: " << toatlBytes;
 
-            auto eof = folly::IOBuf::create(0);
+            /*auto eof = folly::IOBuf::create(0);
+            //eof->append(0);
             auto res = sock->writeChain(id, std::move(eof), false, nullptr);
             if (res.hasError()) {
                 LOG(ERROR) << "Error sending EOF: " << toString(res.error());
             }else{
                 //LOG(INFO) << "file download completed: " << filePath;
                 VLOG(4) << "Sent " << toatlBytes << " bytes of file data for request " << ++requestCnt;
-            }
+            }*/
         }else{
             LOG(ERROR) << "Invalid request type: " << requestType;
             continue;

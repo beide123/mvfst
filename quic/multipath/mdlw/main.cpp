@@ -18,10 +18,6 @@
 DEFINE_string(host, "::1", "Echo server hostname/IP");
 DEFINE_int32(port, 6666, "Echo server port");
 DEFINE_int32(dura, 60, "client running duration(s)");
-DEFINE_uint32(
-    client_timer_ms,
-    1,
-    "Timer for printing out the throughput");
 DEFINE_string(
     mode,
     "server",
@@ -91,7 +87,6 @@ int main(int argc, char* argv[]) {
         FLAGS_host,
         FLAGS_port,
         FLAGS_dura,
-        std::chrono::milliseconds(FLAGS_client_timer_ms),
         FLAGS_use_datagrams,
         FLAGS_active_conn_id_limit,
         FLAGS_enable_migration,
