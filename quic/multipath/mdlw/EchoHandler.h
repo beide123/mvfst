@@ -8,7 +8,7 @@
 #pragma once
 
 #include <quic/api/QuicSocket.h>
-
+#include <quic/server/QuicServerTransport.h>
 #include <quic/common/BufUtil.h>
 
 #include <future>
@@ -38,8 +38,9 @@ class DlwHandler : public quic::QuicSocket::ConnectionSetupCallback,
     }
   }
 
-  void setHandlers(folly::Synchronized<std::vector<std::unique_ptr<DlwHandler>>>* handlers) {
+  void setHandlers(folly::Synchronized<std::vector<std::unique_ptr<DlwHandler>>>* handlers, struct mptcp_sock* mptcp_sock) {
     handlers_ = handlers;
+    mptcp_sock_ = mptcp_sock;
   }
 
   void onNewBidirectionalStream(quic::StreamId id) noexcept override {
@@ -330,7 +331,10 @@ class DlwHandler : public quic::QuicSocket::ConnectionSetupCallback,
             size_t headerSize = strlen("Frame") + sizeof(uint64_t) + sizeof(size_t);
 
             std::streamsize toatlBytes = 0;
-            
+
+            auto connManager = std::dynamic_pointer_cast<SrvConnection>(mptcp_sock_->connManager);
+
+            std::shared_ptr<quic::QuicSocket> dis_sock;
 
             while (file) {
                
@@ -348,7 +352,7 @@ class DlwHandler : public quic::QuicSocket::ConnectionSetupCallback,
                 auto rsp = folly::IOBuf::copyBuffer(rspbuf, headerSize + bytesRead);
                 
                 if (bytesRead > 0) {
-                    auto dis_sock = getAvailableHandlers()->sock;
+                    dis_sock = connManager->getBestConnection().second;
                     auto start_time = std::chrono::steady_clock::now();
                     VLOG(5) << "Sequence Number: " << *reinterpret_cast<const uint64_t*>(rspbuf + strlen("FRAME")) 
                     << "Offset: " << *reinterpret_cast<const size_t*>(rspbuf + strlen("FRAME") + sizeof(uint64_t));
@@ -446,6 +450,7 @@ class DlwHandler : public quic::QuicSocket::ConnectionSetupCallback,
   bool firstRequest_{true};
   std::streamsize currentBytes_{0};
   std::streamsize previousBytes_{0};
+  struct mptcp_sock* mptcp_sock_;
 };
 
 int DlwHandler::requestCnt = 0;  // 在类外初始化静态成员  

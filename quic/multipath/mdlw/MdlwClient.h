@@ -22,6 +22,7 @@
 #include <fizz/compression/ZstdCertificateDecompressor.h>
 
 #include <quic/api/QuicSocket.h>
+#include <quic/api/QuicTransportBase.h>
 #include <quic/client/QuicClientTransport.h>
 #include <quic/common/BufUtil.h>
 #include <quic/common/events/FollyQuicEventBase.h>
@@ -30,6 +31,7 @@
 #include <quic/common/udpsocket/FollyQuicAsyncUDPSocket.h>
 #include <quic/fizz/client/handshake/FizzClientQuicHandshakeContext.h>
 #include <quic/multipath/mdlw/LogQuicStats.h>
+
 
 namespace quic::multipath {
 
@@ -41,8 +43,8 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
                    public quic::QuicSocket::ConnectionCallback,
                    public quic::QuicSocket::ReadCallback,
                    public quic::QuicSocket::WriteCallback,
-                   public quic::QuicSocket::DatagramCallback,
-                   folly::HHWheelTimer::Callback {
+                   public quic::QuicSocket::DatagramCallback
+                   {
  public:
   MdlwClient(
       const std::string& host,
@@ -168,7 +170,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
         }
       }else{
         auto chunkCache = connManager_->getChunkCache();
-        VLOG(1) << "Address of chunkCache: " << &chunkCache;
+        VLOG(1) << "lastReceivedSeq = " << lastReceivedSeq << " Address of chunkCache: " << &chunkCache;
 
         size_t oldLength = connManager_->getChunkCache(lastReceivedSeq)->offset;
         VLOG(1) << "ConnId = " << connId << " Find seq = " << lastReceivedSeq 
@@ -246,10 +248,10 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
       uint64_t expectedSequenceNumber = connManager_->getExpectedSequenceNumber();
       size_t remaiLen = 0;
 
-      int64_t imcompSeqLen = connManager_->getImcompleteSeq(connId);
-      int64_t imcompOffsetLen = connManager_->getImcompleteOffset(connId);
+      int64_t imcompSeqLen = connManager_->getImcompSeqLen(connId);
+      int64_t imcompOffsetLen = connManager_->getImcompOffsetLen(connId);
 
-      if(imcompSeqLen > 0){
+      if(imcompSeqLen >= 0){
         std::string imcompSeq = connManager_->getImcompSeq(connId);
         size_t remain = sizeof(uint64_t) - imcompSeqLen;
         VLOG(1) << "Process imcomplete seq, connId = " << connId
@@ -265,8 +267,8 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
         targetOffset = *reinterpret_cast<const size_t*>(data);
         data += sizeof(size_t);
         remaiLen = dataLength - remain - sizeof(size_t);
-        connManager_->setImcompSeqLen(connId, 0);
-      }else if(imcompOffsetLen > 0){
+        connManager_->setImcompSeqLen(connId, -1);
+      }else if(imcompOffsetLen >= 0){
         std::string imcompOffset = connManager_->getImcompOffset(connId);
         size_t remain = sizeof(size_t) - imcompOffsetLen;
         VLOG(1) << "Process imcomplete offset, connId = " << connId
@@ -280,7 +282,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
         targetOffset = *reinterpret_cast<const size_t*>(imcompOffset.c_str());
         data += remain;
         remaiLen = dataLength - remain;
-        connManager_->setImcompOffsetLen(connId, 0);
+        connManager_->setImcompOffsetLen(connId, -1);
       }else{
         sequenceNumber = *reinterpret_cast<const uint64_t*>(data);
         data += sizeof(uint64_t);
@@ -408,7 +410,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
               VLOG(1) << "Process head merge to frame, connId = " << connId
                       << ", start = " << start << ", pos = " << pos;
               processHeaderfield(connId, originalData + start, pos - start, filePath);
-              connManager_->setIncompFrameLen(connId, 0);
+              connManager_->removeIncompFrameLen(connId);
               start = pos;
           } else {
               // 未找到 "Frame"，根据是否为尾部不完整帧选择处理函数
@@ -418,12 +420,12 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
                   processHeaderfield(connId, originalData + start, pos - start, filePath);
               } else {
                   processHeaderfield(connId, originalData + start, dataLength - start, filePath);
-                  connManager_->setIncompFrameLen(connId, 0);
+                  connManager_->removeIncompFrameLen(connId);
                   start = dataLength;
               }
           }
         }else{
-          connManager_->setIncompFrameLen(connId, 0);
+          connManager_->removeIncompFrameLen(connId);
         }
       }
     
@@ -432,7 +434,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
         size_t pos = currentData.find("FRAME", start);
         if(pos != std::string::npos){
             if(pos > start){
-                if(connManager_->getImcompleteSeq(connId) > 0 || connManager_->getImcompleteOffset(connId) > 0){
+                if(connManager_->hasImcomp(connId)){
                   processHeaderfield(connId, originalData + start, pos - start, filePath);
                 }else{
                   VLOG(1) << "Process datafield, connId = " << connId 
@@ -448,7 +450,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
                 nxt_pos = dataLength;
               }
             }
-            if(nxt_pos - start < 1024){
+            if(nxt_pos - start > 1040){
               VLOG(1) << "This unormal Frame dataLength = " << nxt_pos - start
                       << ", data = " << currentData.substr(start, dataLength - start);
             }
@@ -459,7 +461,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
                   << "start = " << start << ", pos = " << pos;
             processDatafield(connId, originalData + start, pos - start, filePath);
         }else{
-            if(connManager_->getImcompleteSeq(connId) > 0 || connManager_->getImcompleteOffset(connId) > 0){
+            if(connManager_->hasImcomp(connId)){
               processHeaderfield(connId, originalData + start, dataLength - start, filePath);
             }else{
               processDatafield(connId, originalData + start, dataLength - start, filePath);
@@ -493,7 +495,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     }
     if (dataLength > 0) {
         auto dataCopy = std::make_shared<folly::IOBuf>(std::move(current));
-        
+        VLOG(1) << "Read available data= " << dataCopy->toString();
         connManager_->getEventBase()->runInEventBaseThread(
           [this, dataCopy, dataLength, connId, filePath]() {
             mergeData(dataCopy.get(), dataLength, connId, filePath);
@@ -523,7 +525,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     // resetStream
   }
 
-  void timeoutExpired() noexcept override {
+  void timeoutExpired() noexcept {
     auto connIds = connManager_->getAllConnectionIds();
     for (auto& connId : connIds) {
       if (auto client = connManager_->getConnection(connId)) {
@@ -552,7 +554,11 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
   }
 
   void onConnectionEnd() noexcept override {
-    LOG(INFO) << "EchoClient connection end";
+    LOG(INFO) << "MdlwClient::onConnectionEnd() noexcept called";
+  }
+
+  void onConnectionEnd(QuicError /*error*/) noexcept override {
+    LOG(INFO) << "MdlwClient connection end";
   }
 
   void onConnectionSetupError(QuicError error) noexcept override {
@@ -578,12 +584,12 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     }
   }
 
-  /*void onStreamWriteReady(quic::StreamId id, uint64_t maxToSend) noexcept
+  void onStreamWriteReady(quic::StreamId id, uint64_t maxToSend) noexcept
       override {
     LOG(INFO) << "EchoClient socket is write ready with maxToSend="
               << maxToSend;
-    sendMessage(id, pendingOutput_[id], 0);
-  }*/
+    //sendMessage(id, pendingOutput_[id], 0);
+  }
 
   void onMultiStreamWriteReady(int64_t connId, quic::StreamId id, uint64_t maxToSend) noexcept
     override {
@@ -718,8 +724,12 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     auto mev = mergeDataThread.getEventBase();
     auto mEvb = std::make_shared<FollyQuicEventBase>(mev);
 
-    connManager_ = std::make_shared<ConnectionManager>(100, mEvb);
+    connManager_ = std::make_shared<CliConnection>(100, mEvb);
+    mptcp_sock_ = new struct mptcp_sock();
+    mptcp_sock_->connManager = connManager_;
     fileName_ = "CHUNK_1000K.mp4";
+
+    connManager_->setScheduler("rr", mptcp_sock_);
 
     std::vector<folly::SocketAddress> localAddresses; // store different local addresses
     
@@ -785,6 +795,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
         quicClient_->setMultiPath(true);
 
         connManager_->addConnection(idx, quicClient_);
+
         idx++;
       });
     }
@@ -884,8 +895,8 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
   std::string clientCertPath_;
   std::string clientKeyPath_;
   std::string fileName_;
-  folly::Synchronized<std::queue<std::string>> taskQueue_;
-  std::shared_ptr<ConnectionManager> connManager_;
+  std::shared_ptr<CliConnection> connManager_;
+  struct mptcp_sock* mptcp_sock_;
 };
 
 } // namespace quic::samples

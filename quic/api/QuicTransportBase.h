@@ -270,4 +270,288 @@ class QuicTransportBase : public QuicSocket,
   [[nodiscard]] bool checkCustomRetransmissionProfilesEnabled() const;
 };
 
+// 添加 ConnectionManager 类的声明
+class ConnectionManager {
+ public:
+  // Add virtual destructor
+  virtual ~ConnectionManager() = default;
+
+  ConnectionManager(uint64_t capacity) : capacity_(capacity) 
+  {
+    lastReceivedSeq_ = std::unordered_map<int64_t, uint64_t>();
+    imcompOffsetLen_ = std::unordered_map<int64_t, int64_t>();
+    imcompSeqLen_ = std::unordered_map<int64_t, int64_t>();
+    imcompOffset_ = std::unordered_map<int64_t, std::string>();
+    imcompSeq_ = std::unordered_map<int64_t, std::string>();
+    incompFrameLen_ = std::unordered_map<int64_t, size_t>();
+    chunkCache_ =  std::unordered_map<uint64_t, std::shared_ptr<QuicSocket::ChunkData>>();
+  }
+
+  virtual std::vector<int64_t> getAllConnectionIds() = 0;
+
+  virtual bool empty() = 0;
+
+  virtual uint64_t getsize() = 0;
+
+  // Build clientStreams_ mapping
+  void buildClientStreamsMap(int64_t connectionId, StreamId stream_id) {
+    if (clientStreams_.find(connectionId) == clientStreams_.end()) {
+      clientStreams_[connectionId] = stream_id;
+    }else
+      LOG(INFO) << "Connection" << connectionId << "has already created stream" ;
+  }
+
+  StreamId getClientStream(int64_t connectionId) {
+    auto it = clientStreams_.find(connectionId);
+    if (it != clientStreams_.end()) {
+      return it->second;
+    }
+    return StreamId(-1);
+  }
+
+  std::unordered_map<uint64_t, std::shared_ptr<QuicSocket::ChunkData>>& getChunkCache() {
+    return chunkCache_;
+  }
+
+  void setExpectedSequenceNumber(uint64_t expectedSequenceNumber) {
+    expectedSequenceNumber_ = expectedSequenceNumber;
+  }
+
+  uint64_t getExpectedSequenceNumber() {
+    return expectedSequenceNumber_;
+  }
+
+  size_t getChunkOffset() {
+    return chunkOffset_;
+  }
+
+  void setChunkOffset(size_t chunkOffset) {
+    chunkOffset_ += chunkOffset;
+  }
+
+  size_t getChunkTarget() {
+    return chunkTarget_;
+  }
+
+  void setChunkTarget(size_t chunkTarget) {
+    chunkTarget_ += chunkTarget;
+  } 
+
+  uint64_t getLastReceivedSeq(int64_t connectionId) {
+    return lastReceivedSeq_[connectionId];
+  }
+
+  void setLastReceivedSeq(int64_t connectionId, uint64_t lastReceivedSeq) {
+    lastReceivedSeq_[connectionId] = lastReceivedSeq;
+  }
+
+  int64_t getImcompOffsetLen(int64_t connectionId) {
+    auto it = imcompOffsetLen_.find(connectionId);
+    if(it != imcompOffsetLen_.end()) {
+      return it->second;
+    }
+    return -1;
+  }
+
+  int64_t getImcompSeqLen(int64_t connectionId) {
+    auto it = imcompSeqLen_.find(connectionId);
+    if(it != imcompSeqLen_.end()) {
+      return it->second;
+    }
+    return -1;
+  }
+
+  bool hasImcomp(int64_t connectionId) {
+    return getImcompOffsetLen(connectionId) > -1
+    || getImcompSeqLen(connectionId) > -1;
+  }
+
+  void setImcompOffsetLen(int64_t connectionId, int64_t len) {
+    imcompOffsetLen_[connectionId] = len;
+  }
+
+  void setImcompSeqLen(int64_t connectionId, int64_t len) {
+    imcompSeqLen_[connectionId] = len;
+  }
+
+  std::string getImcompOffset(int64_t connectionId) {
+    return imcompOffset_[connectionId];
+  }
+
+  void setImcompOffset(int64_t connectionId, std::string imcompOffset) {
+    imcompOffset_[connectionId] = imcompOffset;
+  }
+
+  std::string getImcompSeq(int64_t connectionId) {
+    return imcompSeq_[connectionId];
+  } 
+
+  void setImcompSeq(int64_t connectionId, std::string imcompSeq) {
+    imcompSeq_[connectionId] = imcompSeq;
+  }
+
+  size_t getIncompFrameLen(int64_t connectionId) {
+    return incompFrameLen_[connectionId];
+  }
+
+  void setIncompFrameLen(int64_t connectionId, size_t incompFrameLen) {
+    incompFrameLen_[connectionId] = incompFrameLen;
+  }
+
+  void removeIncompFrameLen(int64_t connectionId) {
+    auto it = incompFrameLen_.find(connectionId);
+    if(it != incompFrameLen_.end()) {
+      incompFrameLen_.erase(it);
+    }
+  }
+
+  bool isIncompleteFrame(int64_t connectionId) {
+    auto it = incompFrameLen_.find(connectionId);
+    if(it != incompFrameLen_.end()) {
+      return true;
+    }
+    return false;
+  }
+
+  void setChunkCache(uint64_t sequenceNumber, std::shared_ptr<QuicSocket::ChunkData> chunk) {
+    chunkCache_[sequenceNumber] = chunk;
+  }
+
+  void removeChunkCache(uint64_t sequenceNumber) {
+    chunkCache_.erase(sequenceNumber);
+  }
+
+  void emptyChunkCache(uint64_t sequenceNumber) {
+    auto it = chunkCache_.find(sequenceNumber);
+    if (it != chunkCache_.end()) {
+      it->second->offset = 0;
+      it->second->total = 0;
+    }
+  }
+
+  std::shared_ptr<QuicSocket::ChunkData> getChunkCache(uint64_t sequenceNumber) {
+    auto it = chunkCache_.find(sequenceNumber);
+    if (it != chunkCache_.end()) {
+      return it->second;
+    }
+    return nullptr;
+  }
+
+ protected:
+  uint64_t capacity_;
+  std::unordered_map<int64_t, StreamId> clientStreams_;
+  std::unordered_map<uint64_t, std::shared_ptr<QuicSocket::ChunkData>> chunkCache_;
+  
+  size_t chunkOffset_{0};
+  size_t chunkTarget_{0};
+  uint64_t expectedSequenceNumber_{0};
+  
+  std::unordered_map<int64_t, size_t> incompFrameLen_;
+  std::unordered_map<int64_t, int64_t> imcompSeqLen_;
+  std::unordered_map<int64_t, int64_t> imcompOffsetLen_;
+
+  std::unordered_map<int64_t, uint64_t> lastReceivedSeq_;
+
+  std::unordered_map<int64_t, std::string> imcompSeq_;
+  std::unordered_map<int64_t, std::string> imcompOffset_;
+};
+
+struct sock{
+public:
+    sock() {
+        this->id = -1;
+        this->rtt = 0;
+        this->cwnd = 0;
+        this->ssthresh = 0;
+        this->unacked = 0;
+        this->mss = 0;
+        this->is_idle = true;
+        this->last_used_time = 0;
+    }
+
+    void setConnStatus(int64_t id, std::shared_ptr<QuicTransportBase> transport) {
+        if (!transport) return;
+        auto state = transport->getState();
+        if (!state) return;
+
+        this->id = id;
+        this->rtt = state->lossState.srtt.count();
+
+        if (state->congestionController) {
+            this->cwnd = state->congestionController->getCongestionWindow();
+
+            CongestionControllerStats stats;
+            state->congestionController->getStats(stats);
+            switch (state->congestionController->type()) {
+                case CongestionControlType::Cubic:
+                    this->ssthresh = stats.cubicStats.ssthresh;
+                    break;
+                default:
+                    this->ssthresh = 0;
+            }
+        } else {
+            this->cwnd = 0;
+            this->ssthresh = 0;
+        }
+
+        this->unacked = state->lossState.inflightBytes;
+        this->mss = state->udpSendPacketLen;
+        this->is_idle = (this->unacked == 0);
+
+        if (state->lossState.lastAckedTime.has_value()) {
+            this->last_used_time = state->lossState.lastAckedTime.value().time_since_epoch().count();
+        } else {
+            this->last_used_time = 0;
+        }
+    }
+
+    bool isIdle() {
+        return this->is_idle;
+    }
+
+    void setIdle(bool isIdle) {
+        this->is_idle = isIdle;
+    }
+
+    void setLastUsedTime(uint64_t lastUsedTime) {
+        this->last_used_time = lastUsedTime;
+    }
+
+    int64_t getConnId() {
+        return this->id;
+    }
+
+private:
+    int64_t id;
+    uint64_t rtt;
+    uint64_t cwnd;
+    uint64_t ssthresh;
+    uint64_t unacked;
+    uint64_t mss;
+    bool is_idle;
+    uint64_t last_used_time;
+};
+
+struct subflow_send_info {
+	struct sock *ssk;
+	uint64_t linger_time;
+};
+
+struct mptcp_sock {
+public:
+    virtual ~mptcp_sock() = default;
+    mptcp_sock() {
+        connManager = nullptr;
+        connStates = std::unordered_map<int64_t, std::shared_ptr<struct sock>>();
+    }
+    std::shared_ptr<ConnectionManager> connManager;
+    
+    std::unordered_map<int64_t, std::shared_ptr<struct sock>> connStates;
+    void updateConnStatus(int64_t id, std::shared_ptr<QuicTransportBase> transport) {
+        auto connStatus = std::make_shared<struct sock>();
+        connStatus->setConnStatus(id, transport);
+        connStates[id] = connStatus;
+    }
+};
+
 } // namespace quic

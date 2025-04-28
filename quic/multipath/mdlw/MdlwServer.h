@@ -44,8 +44,9 @@ class DlwServerTransportFac : public quic::QuicServerTransportFactory {
 
   explicit DlwServerTransportFac(
       bool useDatagrams = false,
-      bool disableRtx = false)
-      : useDatagrams_(useDatagrams), disableRtx_(disableRtx) {}
+      bool disableRtx = false,
+      struct mptcp_sock* mptcp_sock = nullptr)
+      : useDatagrams_(useDatagrams), disableRtx_(disableRtx), mptcp_sock_(mptcp_sock) {}
 
   quic::QuicServerTransport::Ptr make(
       folly::EventBase* evb,
@@ -63,10 +64,15 @@ class DlwServerTransportFac : public quic::QuicServerTransportFactory {
     auto transport = quic::QuicServerTransport::make(
         evb, std::move(sock), echoHandler.get(), echoHandler.get(), ctx);
     echoHandler->setQuicSocket(transport);
-    echoHandler->setHandlers(&echoHandlers_);
+    auto connManager = std::dynamic_pointer_cast<SrvConnection>(mptcp_sock_->connManager);
+    connManager->addConnection(connNum_, transport);
+    echoHandler->setHandlers(&echoHandlers_, mptcp_sock_);
     echoHandlers_.withWLock([&](auto& echoHandlers) {
       echoHandlers.push_back(std::move(echoHandler));
     });
+    
+    connNum_++;
+
     return transport;
   }
 
@@ -75,6 +81,8 @@ class DlwServerTransportFac : public quic::QuicServerTransportFactory {
   folly::Synchronized<std::vector<std::unique_ptr<DlwHandler>>> echoHandlers_;
   bool draining_{false};
   bool disableRtx_{false};
+  struct mptcp_sock* mptcp_sock_;
+  uint64_t connNum_{0};
 };
 
 class MdlwServer {
@@ -103,11 +111,13 @@ class MdlwServer {
         LOG(FATAL) << "disable_rtx requires use_stream_groups to be enabled";
       }
     }
+
+    mptcp_sock_ = new struct mptcp_sock();
     
     for(int i = 0; i < 1; ++i) {
       auto server_ = QuicServer::createQuicServer(std::move(settings));
       server_->setQuicServerTransportFactory(
-          std::make_unique<DlwServerTransportFac>(useDatagrams, disableRtx));
+          std::make_unique<DlwServerTransportFac>(useDatagrams, disableRtx, mptcp_sock_));
       server_->setTransportStatsCallbackFactory(
           std::make_unique<LogQuicStatsFac>());
       auto serverCtx = quic::test::createServerCtx();
@@ -127,6 +137,10 @@ class MdlwServer {
   void start() {
     // Create a SocketAddress and the default or passed in host.
     int i = 1;
+    auto connManager = std::make_shared<SrvConnection>(10, nullptr);
+    connManager->setScheduler("rr", mptcp_sock_);
+    mptcp_sock_->connManager = connManager;
+
     for(auto server_ : servers_) {
       //folly::SocketAddress addr1("30.1." + std::to_string(i + 1) + ".100", port_);
       folly::SocketAddress addr1(host_, port_);
@@ -134,6 +148,7 @@ class MdlwServer {
       i++; 
       LOG(INFO) << "Echo server" << i << " started at: " << addr1.describe();
     }
+
     eventbase_.loopForever();
   }
 
@@ -143,5 +158,6 @@ class MdlwServer {
   folly::EventBase eventbase_;
   std::vector<std::shared_ptr<quic::QuicServer>> servers_;
   std::vector<std::string> alpns_;
+  struct mptcp_sock* mptcp_sock_;
 };
 } // namespace quic::samples

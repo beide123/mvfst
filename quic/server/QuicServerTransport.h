@@ -20,6 +20,7 @@
 #include <quic/server/state/ServerConnectionIdRejector.h>
 #include <quic/server/state/ServerStateMachine.h>
 #include <quic/state/QuicTransportStatsCallback.h>
+#include <quic/api/QuicScheduler.h>
 
 #include <folly/io/async/AsyncTransportCertificate.h>
 
@@ -277,4 +278,88 @@ class QuicServerTransport
   // when destruction of the transport begins.
   const WrappedSocketObserverContainer wrappedObserverContainer_;
 };
+
+class SrvConnection : public ConnectionManager {
+ public:
+  virtual ~SrvConnection() override = default;
+
+  SrvConnection(uint64_t capacity, std::shared_ptr<FollyQuicEventBase> fEvb) : ConnectionManager(capacity) {
+    fEvb_ = fEvb;
+    connections_ = std::unordered_map<int64_t, std::shared_ptr<QuicServerTransport>>();
+  }
+  // Add connection
+  void addConnection(int64_t connectionId, std::shared_ptr<QuicServerTransport> connection) {
+    if (connectionId > -1) {
+        if (connections_.size() >= capacity_) {
+            LOG(ERROR) << "ConnectionManager capacity is full";
+            return;
+        }
+        connections_[connectionId] = connection; // 更新索引
+        mptcp_sock_->updateConnStatus(connectionId, connection);
+    }else 
+        LOG(ERROR) << "ConnIdx is empty" ;
+  }
+
+  void setScheduler(std::string scheduler, struct mptcp_sock* mptcp_sock) {
+    mptcp_sock_ = mptcp_sock;
+    if (scheduler == "rr") {
+      scheduler_ = std::make_shared<RoundRobinScheduler>();
+    }else{
+      scheduler_ = std::make_shared<RandomScheduler>();
+    }
+  }
+
+  std::vector<int64_t> getAllConnectionIds() {
+    std::vector<int64_t> allConnectionIds;
+    for (const auto& pair : connections_) {
+      allConnectionIds.push_back(pair.first);
+    }
+    return allConnectionIds;
+  }
+
+  bool empty() {
+    return connections_.empty();
+  }
+
+  uint64_t getsize() {
+    return connections_.size();
+  }
+
+  // Get connection
+  std::shared_ptr<QuicServerTransport> getConnection(int64_t& connectionId) {
+    auto it = connections_.find(connectionId);
+    if (it != connections_.end()) {
+      return it->second;
+    }
+    return nullptr; // Connection not exist
+  }
+
+  // Destroy connection
+  void removeConnection(int64_t connectionId) {
+    connections_.erase(connectionId);
+  }
+
+  std::pair<int64_t, std::shared_ptr<QuicServerTransport>> getBestConnection() {
+    int64_t connId = scheduler_->getNextConnectionId(mptcp_sock_);
+    if (connId > - 1) {
+      return std::make_pair(connId, getConnection(connId));
+    }else{
+      LOG(ERROR) << "Scheduler has no available connection to send data";
+      return std::make_pair(int64_t(-1), nullptr);
+    }
+  }
+
+  std::shared_ptr<FollyQuicEventBase> getEventBase() {
+    return fEvb_;
+  }
+
+ private:
+  std::shared_ptr<FollyQuicEventBase> fEvb_;
+  std::unordered_map<int64_t, std::shared_ptr<QuicServerTransport>> connections_;
+  std::shared_ptr<QuicScheduler> scheduler_;
+  struct mptcp_sock* mptcp_sock_;
+};
+
 } // namespace quic
+
+

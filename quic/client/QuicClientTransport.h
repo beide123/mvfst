@@ -10,6 +10,7 @@
 #include <quic/common/events/FollyQuicEventBase.h>
 #include <quic/api/QuicTransportBase.h>
 #include <quic/client/QuicClientTransportLite.h>
+#include <quic/api/QuicScheduler.h>
 
 namespace quic {
 
@@ -110,17 +111,13 @@ class QuicClientTransport : public QuicTransportBase,
   const WrappedSocketObserverContainer wrappedObserverContainer_;
 };
 
-class ConnectionManager {
+class CliConnection : public ConnectionManager {
  public:
-  ConnectionManager(uint64_t capacity, std::shared_ptr<FollyQuicEventBase> fEvb) : capacity_(capacity), fEvb_(fEvb) 
-  {
-    chunkCache_ =  std::unordered_map<uint64_t, std::shared_ptr<QuicSocket::ChunkData>>();
-    lastReceivedSeq_ = std::unordered_map<int64_t, uint64_t>();
-    imcompleteOffset_ = std::unordered_map<int64_t, int64_t>();
-    imcompleteSeq_ = std::unordered_map<int64_t, int64_t>();
-    imcompOffset_ = std::unordered_map<int64_t, std::string>();
-    imcompSeq_ = std::unordered_map<int64_t, std::string>();
-    incompFrameLen_ = std::unordered_map<int64_t, size_t>();
+  virtual ~CliConnection() override = default;
+
+  CliConnection(uint64_t capacity, std::shared_ptr<FollyQuicEventBase> fEvb) : ConnectionManager(capacity) {
+    fEvb_ = fEvb;
+    connections_ = std::unordered_map<int64_t, std::shared_ptr<QuicClientTransport>>();
   }
   // Add connection
   void addConnection(int64_t connectionId, std::shared_ptr<QuicClientTransport> connection) {
@@ -130,8 +127,18 @@ class ConnectionManager {
             return;
         }
         connections_[connectionId] = connection; // 更新索引
+        mptcp_sock_->updateConnStatus(connectionId, connection);
     }else 
         LOG(ERROR) << "ConnIdx is empty" ;
+  }
+
+  void setScheduler(std::string scheduler, struct mptcp_sock* mptcp_sock) {
+    mptcp_sock_ = mptcp_sock;
+    if (scheduler == "rr") {
+      scheduler_ = std::make_shared<RoundRobinScheduler>();
+    }else{
+      scheduler_ = std::make_shared<RandomScheduler>();
+    }
   }
 
   std::vector<int64_t> getAllConnectionIds() {
@@ -140,6 +147,14 @@ class ConnectionManager {
       allConnectionIds.push_back(pair.first);
     }
     return allConnectionIds;
+  }
+
+  bool empty() {
+    return connections_.empty();
+  }
+
+  uint64_t getsize() {
+    return connections_.size();
   }
 
   // Get connection
@@ -173,141 +188,24 @@ class ConnectionManager {
   }
 
   std::pair<int64_t, std::shared_ptr<QuicClientTransport>> getBestConnection() {
-    if (connections_.empty()) {
-      return std::make_pair(int64_t(), nullptr);
+    int64_t connId = scheduler_->getNextConnectionId(mptcp_sock_);
+    if (connId > - 1) {
+      return std::make_pair(connId, getConnection(connId));
+    }else{
+      LOG(ERROR) << "Scheduler has no available connection to send data";
+      return std::make_pair(int64_t(-1), nullptr);
     }
-    unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
-    std::mt19937 gen(seed);
-    std::uniform_int_distribution<> dis(0, connections_.size() - 1);
-
-    auto it = connections_.begin();
-    std::advance(it, dis(gen));
-    return std::make_pair(it->first, it->second);
   }
 
   std::shared_ptr<FollyQuicEventBase> getEventBase() {
     return fEvb_;
   }
 
-  std::unordered_map<uint64_t, std::shared_ptr<QuicSocket::ChunkData>>& getChunkCache() {
-    return chunkCache_;
-  }
-
-  void setExpectedSequenceNumber(uint64_t expectedSequenceNumber) {
-    expectedSequenceNumber_ = expectedSequenceNumber;
-  }
-
-  uint64_t getExpectedSequenceNumber() {
-    return expectedSequenceNumber_;
-  }
-
-  size_t getChunkOffset() {
-    return chunkOffset_;
-  }
-
-  void setChunkOffset(size_t chunkOffset) {
-    chunkOffset_ += chunkOffset;
-  }
-
-  size_t getChunkTarget() {
-    return chunkTarget_;
-  }
-
-  void setChunkTarget(size_t chunkTarget) {
-    chunkTarget_ += chunkTarget;
-  } 
-
-  uint64_t getLastReceivedSeq(int64_t connectionId) {
-    return lastReceivedSeq_[connectionId];
-  }
-
-  void setLastReceivedSeq(int64_t connectionId, uint64_t lastReceivedSeq) {
-    lastReceivedSeq_[connectionId] = lastReceivedSeq;
-  }
-
-  int64_t getImcompleteOffset(int64_t connectionId) {
-    return imcompleteOffset_[connectionId];
-  }
-
-  int64_t getImcompleteSeq(int64_t connectionId) {
-    return imcompleteSeq_[connectionId];
-  }
-
-  void setImcompOffsetLen(int64_t connectionId, int64_t imcomplete) {
-    imcompleteOffset_[connectionId] = imcomplete;
-  }
-
-  void setImcompSeqLen(int64_t connectionId, int64_t imcomplete) {
-    imcompleteSeq_[connectionId] = imcomplete;
-  }
-
-  std::string getImcompOffset(int64_t connectionId) {
-    return imcompOffset_[connectionId];
-  }
-
-  void setImcompOffset(int64_t connectionId, std::string imcompOffset) {
-    imcompOffset_[connectionId] = imcompOffset;
-  }
-
-  std::string getImcompSeq(int64_t connectionId) {
-    return imcompSeq_[connectionId];
-  } 
-
-  void setImcompSeq(int64_t connectionId, std::string imcompSeq) {
-    imcompSeq_[connectionId] = imcompSeq;
-  }
-
-  size_t getIncompFrameLen(int64_t connectionId) {
-    return incompFrameLen_[connectionId];
-  }
-
-  void setIncompFrameLen(int64_t connectionId, size_t incompFrameLen) {
-    incompFrameLen_[connectionId] = incompFrameLen;
-  }
-
-  bool isIncompleteFrame(int64_t connectionId) {
-    return incompFrameLen_[connectionId] > 0;
-  }
-
-  void setChunkCache(uint64_t sequenceNumber, std::shared_ptr<QuicSocket::ChunkData> chunk) {
-    chunkCache_[sequenceNumber] = chunk;
-  }
-
-  void removeChunkCache(uint64_t sequenceNumber) {
-    chunkCache_.erase(sequenceNumber);
-  }
-
-  void emptyChunkCache(uint64_t sequenceNumber) {
-    auto it = chunkCache_.find(sequenceNumber);
-    if (it != chunkCache_.end()) {
-      it->second->offset = 0;
-      it->second->total = 0;
-    }
-  }
-
-  std::shared_ptr<QuicSocket::ChunkData> getChunkCache(uint64_t sequenceNumber) {
-    auto it = chunkCache_.find(sequenceNumber);
-    if (it != chunkCache_.end()) {
-      return it->second;
-    }
-    return nullptr;
-  }
-
  private:
-  uint64_t capacity_; 
   std::shared_ptr<FollyQuicEventBase> fEvb_;
   std::unordered_map<int64_t, std::shared_ptr<QuicClientTransport>> connections_;
-  std::unordered_map<int64_t, StreamId> clientStreams_;
-  std::unordered_map<uint64_t, std::shared_ptr<QuicSocket::ChunkData>> chunkCache_;
-  uint64_t expectedSequenceNumber_{0};
-  size_t chunkOffset_{0};
-  size_t chunkTarget_{0};
-  std::unordered_map<int64_t, uint64_t> lastReceivedSeq_;
-  std::unordered_map<int64_t, int64_t> imcompleteOffset_;
-  std::unordered_map<int64_t, int64_t> imcompleteSeq_;
-  std::unordered_map<int64_t, std::string> imcompOffset_;
-  std::unordered_map<int64_t, std::string> imcompSeq_;
-  std::unordered_map<int64_t, size_t> incompFrameLen_;
+  std::shared_ptr<QuicScheduler> scheduler_;
+  struct mptcp_sock* mptcp_sock_;
 };
 
 }// namespace quic
