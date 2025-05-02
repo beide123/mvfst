@@ -467,9 +467,10 @@ public:
         this->mss = 0;
         this->is_idle = true;
         this->last_used_time = 0;
+        this->transport = nullptr;
     }
 
-    void setConnStatus(int64_t id, std::shared_ptr<QuicTransportBase> transport) {
+    void setConnStatus(int64_t id) {
         if (!transport) return;
         auto state = transport->getState();
         if (!state) return;
@@ -499,13 +500,27 @@ public:
         this->is_idle = (this->unacked == 0);
 
         if (state->lossState.lastAckedTime.has_value()) {
-            this->last_used_time = state->lossState.lastAckedTime.value().time_since_epoch().count();
+            auto duration_since_epoch = state->lossState.lastAckedTime.value().time_since_epoch();
+            this->last_used_time = std::chrono::duration_cast<std::chrono::milliseconds>(duration_since_epoch).count();
         } else {
             this->last_used_time = 0;
         }
     }
 
     bool isIdle() {
+        // 检查未确认字节是否为0
+        bool noUnacked = (getUnacked() == 0);
+        
+        // 检查是否有可写流
+        bool noPendingSend = true;
+        auto state = transport ? transport->getState() : nullptr;
+        if (state && state->streamManager) {
+            // 使用 streamManager->hasWritable() 判断是否有待发送的数据
+            noPendingSend = !state->streamManager->hasWritable();
+        }
+
+        // 只有当没有未确认字节且没有待发送数据时，才认为空闲
+        this->is_idle = noUnacked && noPendingSend;
         return this->is_idle;
     }
 
@@ -521,6 +536,101 @@ public:
         return this->id;
     }
 
+    void setTransport(std::shared_ptr<QuicTransportBase> transport) {
+        this->transport = transport;
+    }
+    
+    // 添加获取RTT的方法
+    uint64_t getRtt() {
+        auto state = transport->getState();
+        if (!state) return 0;
+        this->rtt = state->lossState.srtt.count();
+        return this->rtt;
+    }
+    
+    // 添加获取拥塞窗口的方法
+    uint64_t getCwnd() {
+        auto state = transport->getState();
+        if (!state) return 0;
+        this->cwnd = state->congestionController->getCongestionWindow();
+        return this->cwnd;
+    }
+
+    // 添加获取未确认字节数的方法
+    uint64_t getUnacked() {
+        auto state = transport->getState();
+        if (!state) return 0;
+        this->unacked = state->lossState.inflightBytes;
+        return this->unacked;
+    }
+
+    bool isGood() {
+        return this->transport && this->transport->good();
+    }
+
+    bool isPendingSend() {
+        uint64_t minCwndBytes = 0;
+        auto state = this->transport->getState();
+        if (state->udpSendPacketLen > 0) { 
+             minCwndBytes = state->transportSettings.minCwndInMss * state->udpSendPacketLen;
+        } else {
+             minCwndBytes = state->transportSettings.minCwndInMss * kDefaultUDPSendPacketLen;
+        }
+        uint64_t currentCwndBytes = this->getCwnd(); 
+        if (currentCwndBytes < minCwndBytes) {
+            LOG(ERROR) << "Subflow " << id << " Cwnd too small (" << currentCwndBytes << " < " << minCwndBytes << " bytes)";
+            return false;
+        }
+        return true;
+    }
+
+    bool isLastUsedTime() {
+        auto state = transport->getState();
+        if (!state || !state->lossState.lastAckedTime.has_value()) {
+            // 如果没有收到过ACK，或者无法获取状态，可以认为它不活跃（或根据需求处理）
+            LOG(ERROR) << "Subflow " << id << " has no lastAckedTime or state";
+            return false; // 或者 true，取决于如何定义从未收到ACK的情况
+        }
+
+        auto lastAck = state->lossState.lastAckedTime.value(); // steady_clock::time_point
+        auto steady_now = std::chrono::steady_clock::now();
+        
+        auto idle_duration = steady_now - lastAck; // 计算steady_clock的差值
+        auto idle_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(idle_duration);
+
+        VLOG(2) << "Subflow " << id << " steady_now: " << steady_now.time_since_epoch().count() 
+                 << " last ack: " << lastAck.time_since_epoch().count() 
+                 << " idle duration ms: " << idle_duration_ms.count();
+                 
+        const uint64_t maxIdleTimeMs = 1000; 
+        if (idle_duration_ms.count() > maxIdleTimeMs) {
+            LOG(ERROR) << "Subflow " << id << " inactive for too long (" << idle_duration_ms.count() << "ms)";
+            return false;
+        }     
+        return true;
+    }
+    // 添加获取 transport 的方法
+    std::shared_ptr<QuicTransportBase> getTransport() {
+        return this->transport;
+    }
+
+    // Get last used time in milliseconds since epoch (for external use if needed, maybe rename)
+    // Note: This interpretation might be misleading if lastAckedTime is steady_clock based.
+    uint64_t getLastUsedTimeMsSinceEpoch() { // Renamed for clarity
+        auto state = transport->getState();
+        if (!state) return 0;
+        if (state->lossState.lastAckedTime.has_value()) {
+            // WARNING: Converting steady_clock to system_clock equivalent is complex
+            // and potentially inaccurate. This provides the millisecond count
+            // since steady_clock's epoch, NOT system_clock's epoch.
+            // For comparing durations, use the steady_clock approach in isLastUsedTime().
+            auto duration_since_steady_epoch = state->lossState.lastAckedTime.value().time_since_epoch();
+            return std::chrono::duration_cast<std::chrono::milliseconds>(duration_since_steady_epoch).count();
+        } else {
+            return 0;
+        }
+    }
+
 private:
     int64_t id;
     uint64_t rtt;
@@ -530,6 +640,7 @@ private:
     uint64_t mss;
     bool is_idle;
     uint64_t last_used_time;
+    std::shared_ptr<QuicTransportBase> transport;
 };
 
 struct subflow_send_info {
@@ -537,19 +648,41 @@ struct subflow_send_info {
 	uint64_t linger_time;
 };
 
+#define MPTCP_SCHED_SIZE 10
+
+// 定义mptcp_subflow_context结构体
+struct mptcp_subflow_context {
+  public:
+    int16_t subflow_id;
+    struct sock *ssk;
+    bool backup;
+    bool request_bkup;
+    int stale_count;
+    mptcp_subflow_context(int subflow_id) {
+        this->subflow_id = subflow_id;
+        this->ssk = new struct sock();
+        this->backup = false;
+        this->request_bkup = false;
+        this->stale_count = 0;
+    }
+    uint8_t mptcp_sched[MPTCP_SCHED_SIZE] __attribute__((aligned(8)));
+};
+
 struct mptcp_sock {
 public:
     virtual ~mptcp_sock() = default;
     mptcp_sock() {
         connManager = nullptr;
-        connStates = std::unordered_map<int64_t, std::shared_ptr<struct sock>>();
+        connStates = std::unordered_map<int64_t, std::shared_ptr<struct mptcp_subflow_context>>();
     }
     std::shared_ptr<ConnectionManager> connManager;
     
-    std::unordered_map<int64_t, std::shared_ptr<struct sock>> connStates;
+    std::unordered_map<int64_t, std::shared_ptr<struct mptcp_subflow_context>> connStates;
     void updateConnStatus(int64_t id, std::shared_ptr<QuicTransportBase> transport) {
-        auto connStatus = std::make_shared<struct sock>();
-        connStatus->setConnStatus(id, transport);
+        auto connStatus = std::make_shared<struct mptcp_subflow_context>(id);
+    
+        connStatus->ssk->setTransport(transport);
+        connStatus->ssk->setConnStatus(id);
         connStates[id] = connStatus;
     }
 };

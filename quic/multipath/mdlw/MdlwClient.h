@@ -86,14 +86,14 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
 
   bool isTailHasIncompFrame(const std::string& data, int64_t connId, size_t len, size_t& pos){
     // 检查末尾4个字符
-    std::string tail = "FRAM";
+    std::string tail = frameLabel_.substr(0, 4);
     for(size_t i = tail.length(); i > 0; i--){
       if(len >= i && data.substr(len-i) == tail.substr(0, i)){
         pos = len - i;
         connManager_->setIncompFrameLen(connId, i);
         VLOG(1) << "Check tail has incomp frame, connId = " << connId
             << ", len = " << len
-            << ", data = " << data;
+            << ", data = " << data.substr(len-i);
         return true;
       }
     }
@@ -103,16 +103,24 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
   bool isHeadMergeToFrame(const std::string& data, int64_t connId, size_t& left){
     size_t incompFrameLen = connManager_->getIncompFrameLen(connId);
     
-    std::string head = "FRAME";
-    size_t headLen = head.length();
-    left = headLen - incompFrameLen;
+    std::string head = frameLabel_;
+    size_t headLen = head.length(), leftLen = headLen - incompFrameLen;
+
+    VLOG(1) << "Check if head merge to frame, connId = " << connId
+            << ", incompFrameLen = " << incompFrameLen
+            << ", left = " << left
+            << ", data = " << data.substr(0, leftLen);
     
     if(incompFrameLen > 0 && incompFrameLen < headLen){
       std::string prefix = head.substr(0, incompFrameLen);
-      if(prefix + data.substr(0, left) == "FRAME"){
+      if(prefix + data.substr(0, leftLen) == head){
+        left = leftLen;
+        VLOG(1) << "Can merge head to frame, connId = " << connId
+                << ", left = " << left;
         return true;
       }
     }
+    
     return false;
   }
 
@@ -207,21 +215,21 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
 
   void processImcompleteHeader(int64_t connId, const char* data, size_t dataLength) {
     if(dataLength < sizeof(uint64_t)){
-        VLOG(1) << "Process imcomplete header seq, connId = " << connId
+        VLOG(1) << "Detect imcomplete header seq, connId = " << connId
                 << ", dataLength = " << dataLength
                 << ", data = " << data;
         std::string imcompSeq(data, dataLength);
         
         connManager_->setImcompSeqLen(connId, dataLength);
         connManager_->setImcompSeq(connId, imcompSeq);
-        VLOG(1) << "Process imcomplete header seq, connId = " << connId
+        VLOG(1) << "Detect imcomplete header seq, connId = " << connId
                 << ", writen offset = " << dataLength
                 << ", imcompSeq = " << imcompSeq;
     }else{
         uint64_t sequenceNumber = *reinterpret_cast<const uint64_t*>(data);
         connManager_->setLastReceivedSeq(connId, sequenceNumber);
         data += sizeof(uint64_t);
-        VLOG(1) << "Process imcomplete header offset, connId = " << connId
+        VLOG(1) << "Detect imcomplete header offset, connId = " << connId
                 << ", dataLength = " << dataLength
                 << ", sequenceNumber = " << sequenceNumber
                 << ", data = " << data;
@@ -229,7 +237,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
         
         connManager_->setImcompOffsetLen(connId, dataLength - sizeof(uint64_t));
         connManager_->setImcompOffset(connId, imcompOffset);
-        VLOG(1) << "Process imcomplete header offset, connId = " << connId
+        VLOG(1) << "Detect imcomplete header offset, connId = " << connId
                 << ", writen offset = " << dataLength - sizeof(uint64_t)
                 << ", imcompOffset = " << imcompOffset;
     }
@@ -394,59 +402,75 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
       if (memcmp(originalData, "HTTP/1.1", 8) == 0) {
           LOG(INFO) << "HTTP/1.1 response received";
           size_t ac_header_len = strlen("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+          activePath_[connId] = true;
           originalData += ac_header_len;
           dataLength -= ac_header_len;
       }
 
       std::string currentData(originalData, dataLength);
 
-      size_t start = 0, pos = 0, str_len = strlen("FRAME"), left = 0;
+      size_t start = 0, pos = 0, str_len = strlen(frameLabel_.c_str()), left = 0;
 
       if(connManager_->isIncompleteFrame(connId)){
+        //Check if the head can merge to frame label "FRAME"
         if(isHeadMergeToFrame(currentData, connId, start)){
-          pos = currentData.find("FRAME", start);
+          //Merge successfully, find the next frame header position
+          pos = currentData.find(frameLabel_, start);
           if (pos != std::string::npos) {
-              // 找到 "Frame"，处理头部字段
-              VLOG(1) << "Process head merge to frame, connId = " << connId
+              // Find the next frame header, process the data ahead of it
+              VLOG(1) << "Process frame head merge to frame, connId = " << connId
                       << ", start = " << start << ", pos = " << pos;
               processHeaderfield(connId, originalData + start, pos - start, filePath);
               connManager_->removeIncompFrameLen(connId);
               start = pos;
           } else {
-              // 未找到 "Frame"，根据是否为尾部不完整帧选择处理函数
+              // Not found "Frame", choose the processing function based on tail completion
               if (isTailHasIncompFrame(currentData, connId, dataLength, pos)) {
-                  VLOG(1) << "Process tail has incomp frame, connId = " << connId
+                  VLOG(1) << "Process frame head merge with incomp tail, connId = " << connId
                           << ", start = " << start << ", pos = " << pos;
                   processHeaderfield(connId, originalData + start, pos - start, filePath);
               } else {
+                  VLOG(1) << "Process frame head merge without tail, connId = " << connId
+                          << ", start = " << start << ", pos = " << pos;
                   processHeaderfield(connId, originalData + start, dataLength - start, filePath);
                   connManager_->removeIncompFrameLen(connId);
                   start = dataLength;
               }
           }
         }else{
+          //Merge failed, write the last stored string into file
+          size_t lastLen = connManager_->getIncompFrameLen(connId);
+          const char* last = frameLabel_.c_str();
+          processDatafield(connId, last, lastLen, filePath);
           connManager_->removeIncompFrameLen(connId);
         }
       }
     
-      // 检查是否是帧头 (0x123456)
       while (start < dataLength) {
-        size_t pos = currentData.find("FRAME", start);
+        //Find next frame header position
+        size_t pos = currentData.find(frameLabel_, start);
         if(pos != std::string::npos){
             if(pos > start){
+                //Process data ahead of the next frame header
                 if(connManager_->hasImcomp(connId)){
+                  //Process Frame header with imcomplete sequence number or offset
                   processHeaderfield(connId, originalData + start, pos - start, filePath);
                 }else{
+                  //Process datafield
                   VLOG(1) << "Process datafield, connId = " << connId 
                           << ", start = " << start << ", pos = " << pos
                           << ", dataLength = " << pos - start;
                   processDatafield(connId, originalData + start, pos - start, filePath);
                 }
             }
+
+            //Start to process the next frame header
             start = pos + str_len;
-            size_t nxt_pos = currentData.find("FRAME", start);
+            //Find the next frame header position
+            size_t nxt_pos = currentData.find(frameLabel_, start);
             if(nxt_pos == std::string::npos){
-              if(!isTailHasIncompFrame(currentData, connId, start, nxt_pos)){
+              //No next frame header, check if the tail has incompleted label "FRAME"
+              if(!isTailHasIncompFrame(currentData, connId, dataLength, nxt_pos)){
                 nxt_pos = dataLength;
               }
             }
@@ -454,19 +478,31 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
               VLOG(1) << "This unormal Frame dataLength = " << nxt_pos - start
                       << ", data = " << currentData.substr(start, dataLength - start);
             }
+            //Process the data next frame header
             processHeaderfield(connId, originalData + start, nxt_pos - start, filePath);
-            start = nxt_pos;
+            if(connManager_->isIncompleteFrame(connId)){
+              start = dataLength;
+            }else{
+              start = nxt_pos;
+            }
         }else if(isTailHasIncompFrame(currentData, connId, dataLength, pos)){
+            //Tail has incomp frame label "FRAME", process the data before it
             VLOG(1) << "Tail has incomp frame, connId = " << connId 
                   << "start = " << start << ", pos = " << pos;
+            //The label start position is pos, process the data before it
             processDatafield(connId, originalData + start, pos - start, filePath);
+            //The whole data is finished, set the start to dataLength
+            start = dataLength;
         }else{
+            //No Frame labelor tail, just process the data
             if(connManager_->hasImcomp(connId)){
+              //Process the data with imcomplete sequence number or offset
               processHeaderfield(connId, originalData + start, dataLength - start, filePath);
             }else{
+              //Process the datafield
               processDatafield(connId, originalData + start, dataLength - start, filePath);
             }
-          start = dataLength;
+            start = dataLength;
         }
      }
   }
@@ -495,9 +531,10 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     }
     if (dataLength > 0) {
         auto dataCopy = std::make_shared<folly::IOBuf>(std::move(current));
-        VLOG(1) << "Read available data= " << dataCopy->toString();
+        VLOG(2) << "Read available data= " << dataCopy->toString();
         connManager_->getEventBase()->runInEventBaseThread(
           [this, dataCopy, dataLength, connId, filePath]() {
+            VLOG(2) << "Merge data is " << dataCopy->toString();
             mergeData(dataCopy.get(), dataLength, connId, filePath);
           });
         
@@ -634,7 +671,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
       do {
         stream = client->createBidirectionalStream();
       } while (!stream.hasValue());
-      // 设置流的读回调
+      // Set the read callback
       auto streamId = stream.value();
       client->setReadCallback(streamId, this);
       LOG(INFO) << "Client " << connId << " Created stream ID: " << streamId;
@@ -649,6 +686,14 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
           }
       });
     }
+
+    bool isAllActive = true;
+    while(!isAllActive){
+      for(auto& connId : ConnIds ){
+        isAllActive &= activePath_[connId];
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
     
     auto start = std::chrono::steady_clock::now();
 
@@ -659,7 +704,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
         size_t batchStart = i;
        
         while (i < numRequests && i < batchStart + 1000) {
-            // 构造请求内容
+            // Construct the request content
             auto client_pair = connManager_->getBestConnection();
             auto connId = client_pair.first;
             auto client = client_pair.second;
@@ -669,20 +714,20 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
             }
             auto streamId = connManager_->getClientStream(connId);
             //LOG(INFO) << "Submitting task: index=" << i;
-            // 将发送任务交给 EventBaseThread
+            // Submit the send task to EventBaseThread
             client->getEventBase()->runInEventBaseThread([this, request = std::move(request), connId, i, streamId]() {
-                // 保存请求内容到待发送的 map
+                // Save the request content to the pending send map
                 auto& pendingOutput_ = pendingOutputs_[connId];
                 pendingOutput_[streamId].append(folly::IOBuf::copyBuffer(request));
 
-                // 实际发送请求
+                // Send the request
                 sendMessage(streamId, pendingOutput_[streamId], i, connId);
             });
             ++i;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10)); // 每批发送后等待10ms
+        std::this_thread::sleep_for(std::chrono::milliseconds(10)); // Wait 10ms after each batch
         if (std::cin.eof()) {
-          break; // 退出循环
+          break; // Exit the loop
         }
     }
   }
@@ -696,18 +741,18 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     currentTotalBytes_conn1 += recvOffsets_[1][0];
     size_t currentTotalBytes = currentTotalBytes_conn0 + currentTotalBytes_conn1;
 
-    // 计算时间差
+    // Calculate the time difference
     std::chrono::duration<double> elapsed = currentTime - lastTime;
 
-    // 每秒打印吞吐量
+    // Print the throughput every second
     if (elapsed.count() >= 1.0) {
-        float throughput = (float)(currentTotalBytes - lastTotalBytes) * 8 / 1024 / 1024; // 当前秒的吞吐量，换算成Mbps
+        float throughput = (float)(currentTotalBytes - lastTotalBytes) * 8 / 1024 / 1024; // Current throughput, converted to Mbps
         float throughput_conn0 = (float)(currentTotalBytes_conn0 - lastTotalBytes_conn0) * 8 / 1024 / 1024; // 当前秒的吞吐量，换算成Mbps
         float throughput_conn1 = (float)(currentTotalBytes_conn1 - lastTotalBytes_conn1) * 8 / 1024 / 1024; // 当前秒的吞吐量，换算成Mbps
         LOG(INFO) << "The Download Throughput: " << throughput << " Mbps\n"
                   << " -----conn0: " << throughput_conn0 << " Mbps\n"
                   << " -----conn1: " << throughput_conn1 << " Mbps\n";
-        // 更新上一次的字节数和时间
+        // Update the last bytes and time
         lastTotalBytes = currentTotalBytes;
         lastTotalBytes_conn0 = currentTotalBytes_conn0;
         lastTotalBytes_conn1 = currentTotalBytes_conn1;
@@ -728,7 +773,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     mptcp_sock_ = new struct mptcp_sock();
     mptcp_sock_->connManager = connManager_;
     fileName_ = "CHUNK_1000K.mp4";
-
+    frameLabel_ = "FRAME";
     connManager_->setScheduler("rr", mptcp_sock_);
 
     std::vector<folly::SocketAddress> localAddresses; // store different local addresses
@@ -793,6 +838,8 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
         quicClient_->setClientConnIdx(idx);
 
         quicClient_->setMultiPath(true);
+
+        activePath_[idx] = false;
 
         connManager_->addConnection(idx, quicClient_);
 
@@ -887,6 +934,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
   bool running_ = true;
   std::map<uint64_t, std::map<quic::StreamId, BufQueue>> pendingOutputs_;
   std::map<uint64_t, std::map<quic::StreamId, uint64_t>> recvOffsets_;
+  std::map<uint64_t, volatile bool> activePath_;
   folly::fibers::Baton startDone_;
   std::array<StreamGroupId, kNumTestStreamGroups> streamGroups_;
   size_t curGroupIdIdx_{0};
@@ -895,6 +943,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
   std::string clientCertPath_;
   std::string clientKeyPath_;
   std::string fileName_;
+  std::string frameLabel_;
   std::shared_ptr<CliConnection> connManager_;
   struct mptcp_sock* mptcp_sock_;
 };
