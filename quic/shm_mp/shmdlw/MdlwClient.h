@@ -10,6 +10,7 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <semaphore.h>
 
 #include <glog/logging.h>
 
@@ -30,23 +31,29 @@
 #include <quic/common/test/TestUtils.h>
 #include <quic/common/udpsocket/FollyQuicAsyncUDPSocket.h>
 #include <quic/fizz/client/handshake/FizzClientQuicHandshakeContext.h>
-#include <quic/multipath/mdlw/LogQuicStats.h>
+#include <quic/shm_mp/shmdlw/LogQuicStats.h>
+
+#include <shm_sock.h>
+
+#define SHM_NAME "/my_shared_memory" // 共享内存名称
+#define BUFFER_SIZE 1024
+#define MAX_CLIENTS 100
 
 
-namespace quic::multipath {
+namespace quic::shm_mp {
 
 constexpr size_t kNumTestStreamGroups = 2;
 
 size_t fileCounter = 0;
 
-class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
+class ShmMdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
                    public quic::QuicSocket::ConnectionCallback,
                    public quic::QuicSocket::ReadCallback,
                    public quic::QuicSocket::WriteCallback,
                    public quic::QuicSocket::DatagramCallback
                    {
  public:
-  MdlwClient(
+  ShmMdlwClient(
       const std::string& host,
       uint16_t port,
       uint16_t duration,
@@ -70,18 +77,64 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
         clientCertPath_(clientCertPath),
         clientKeyPath_(clientKeyPath) {}
 
+  typedef struct {
+      char server_ip[16];
+      uint16_t port;
+      int packet_length;
+      int test_duration;
+      int conn_num;
+  } config_t;
+
+  // 客户端信息结构体
+  typedef struct {
+      int client_id;
+      int sock;
+      int shm_sock;
+      config_t *config;
+      shm_config_t *shm_config;
+      char send_buff[BUFFER_SIZE];
+      char recv_buff[BUFFER_SIZE];
+  } client_info_t;
+
   void readAvailable(quic::StreamId streamId) noexcept override {
     LOG(INFO) << "EchoClient readAvailable streamId=" << streamId;
   }
 
+  int read_cli_config(const char *filename, config_t *config) {
+    FILE *file = fopen(filename, "r");
+    if (file == NULL) {
+        LOG_ERROR(__func__, "Failed to open config file");
+        return -1;
+    }
+
+    // 解析配置文件
+    fscanf(file, "server_ip=%15s\n", config->server_ip);
+    fscanf(file, "port=%d\n", &config->port);
+    fscanf(file, "packet_length=%d\n", &config->packet_length);
+    fscanf(file, "test_duration=%d\n", &config->test_duration);
+    fscanf(file, "conn_num=%d\n", &config->conn_num);
+
+    fclose(file);
+    return 0;
+  }
+
   void writeDataToFile(const char* chunk, size_t dataLength, const std::string& filePath) {
-    std::ofstream outputFile(filePath, std::ios::app | std::ios::binary);
+    /*std::ofstream outputFile(filePath, std::ios::app | std::ios::binary);
     if (outputFile.is_open()) {
         outputFile.write(chunk, dataLength);
         outputFile.close();
     } else {
         std::cerr << "Error: Unable to open file for writing." << std::endl;
+    }*/
+    size_t bytesWritten = 0;
+    int64_t shm_sock = connManager_->getShmSocket();
+    bytesWritten = shm_write(shm_sock, chunk, dataLength);
+    if(bytesWritten != dataLength){
+      LOG(ERROR) << "Write data to shm failed, bytesWritten = " << bytesWritten
+                 << ", dataLength = " << dataLength;
+      exit(1);
     }
+    sem_post(sem_r);
   }
 
   bool isTailHasIncompFrame(const std::string& data, int64_t connId, size_t len, size_t& pos){
@@ -521,11 +574,11 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     size_t dataLength = current.length();
     
     std::string filePath = "./" + fileName_;
-    std::ofstream file(filePath, std::ios::binary | std::ios::app);
+    /*std::ofstream file(filePath, std::ios::binary | std::ios::app);
     if (!file) {
       LOG(ERROR) << "Failed to create file: " << filePath;
       return;
-    }
+    }*/
     if (recvOffsets_.find(connId) == recvOffsets_.end() || recvOffsets_[connId].find(streamId) == recvOffsets_[connId].end()) {
         recvOffsets_[connId][streamId] = 0; 
     }
@@ -657,9 +710,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
 
   }
 
-  void generateRequests(size_t numRequests) {
-    size_t i = 0;
-    
+  bool activateConnections(){
     std::vector<int64_t> ConnIds = connManager_->getAllConnectionIds();
     for (auto& connId : ConnIds) {
       auto client = connManager_->getConnection(connId);
@@ -694,6 +745,39 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
         isAllActive &= activePath_[connId];
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    return isAllActive;
+  }
+
+  void scheduleRequests(char *request, std::chrono::steady_clock::time_point& start, uint64_t& i){
+    auto client_pair = connManager_->getBestConnection();
+    auto connId = client_pair.first;
+    auto client = client_pair.second;
+    if (!client) {
+      LOG(ERROR) << "No available connection to send data";
+      return;
+    }
+    auto streamId = connManager_->getClientStream(connId);
+    //LOG(INFO) << "Submitting task: index=" << i;
+    // Submit the send task to EventBaseThread
+    client->getEventBase()->runInEventBaseThread([this, request = std::move(request), connId, i, streamId]() {
+        // Save the request content to the pending send map
+        auto& pendingOutput_ = pendingOutputs_[connId];
+        pendingOutput_[streamId].append(folly::IOBuf::copyBuffer(request));
+
+        // Send the request
+        sendMessage(streamId, pendingOutput_[streamId], i, connId);
+    });
+    ++i;
+  }
+
+  void generateRequests(size_t numRequests) {
+    size_t i = 0;
+    
+    if(!activateConnections()){
+      LOG(ERROR) << "Failed to activate connections";
+      return;
     }
     
     auto start = std::chrono::steady_clock::now();
@@ -731,6 +815,86 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
           break; // Exit the loop
         }
     }
+  }
+
+  void ReadDataFromShm(client_info_t *client_info){
+  
+    int cid = client_info->client_id;
+    config_t *config = client_info->config;
+    shm_config_t *shm_config = client_info->shm_config;
+
+    int listen_fd = -1;
+
+    int conn_fds[3];
+    int i = 0;
+   
+    int server_fd = -1;
+    sockaddr_in address;
+
+    activateConnections();
+
+    // 1. 创建 shm socket
+    if ((server_fd = shm_socket(0, shm_config->shm_size, 0)) < 0) {
+        LOG_ERROR(__func__, "socket failed");
+        cleanup_shared_memory(1);
+        exit(EXIT_FAILURE);
+    }
+
+    // 2. 绑定地址和端口
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(config->port);
+
+    if (shm_bind(server_fd, (const char*)&address, sizeof(address)) < 0) {
+        LOG(ERROR) << "shm_bind failed";
+        cleanup_shared_memory(1);
+        exit(EXIT_FAILURE);
+    }
+
+    // 3. 监听连接
+    if (shm_listen(server_fd, 10) < 0) {
+        LOG(ERROR) << "shm_listen failed";
+        cleanup_shared_memory(1);
+        exit(EXIT_FAILURE);
+    }
+
+    socklen_t addrlen = sizeof(address);
+    int sock = shm_accept(server_fd, (struct sockaddr *)&address, &addrlen);
+
+    client_info->shm_sock = sock;
+
+    connManager_->setShmSocket(sock);
+
+    auto start = std::chrono::steady_clock::now();
+    uint64_t cnt = 0;
+
+    while(1) {
+        // 等待客户端通知
+        sem_wait(sem_w);  // 信号量 -1，等待信号
+
+        ssize_t bytes_read = shm_read(sock, client_info->recv_buff, sizeof(client_info->recv_buff));
+        if (bytes_read < 0) {
+            LOG(ERROR) << "Failed to read from socket";
+            break;
+        }
+        client_info->recv_buff[bytes_read] = '\0'; // 确保字符串结束
+        VLOG(1) << "Read from shared memory: " << client_info->recv_buff;
+
+        // 等待数据处理完毕
+        scheduleRequests(client_info->recv_buff, start, cnt);
+        
+        VLOG(1) << "Sent to remote server ";
+        request_shm_counts_++;
+    }
+
+    // close shm socket
+    if (close(client_info->sock) == -1) {
+        LOG(ERROR) << "Failed to close listening socket";
+        cleanup_shared_memory(1);
+    }
+    LOG(INFO) << "Closed listening socket " << client_info->sock;
+
+    sem_destroy(sem_w);
   }
 
   size_t calculateThroughput(std::chrono::steady_clock::time_point& lastTime, size_t& lastTotalBytes, size_t& lastTotalBytes_conn0, size_t& lastTotalBytes_conn1) {
@@ -773,16 +937,25 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     connManager_ = std::make_shared<CliConnection>(100, mEvb);
     mptcp_sock_ = new struct mptcp_sock();
     mptcp_sock_->connManager = connManager_;
-    fileName_ = "CHUNK_1000K.mp4";
+    fileName_ = "CHUNK_9999K.mp4";
     frameLabel_ = "FRAME";
     connManager_->setScheduler("rr", mptcp_sock_);
 
     std::vector<folly::SocketAddress> localAddresses; // store different local addresses
+
+    config_t *config = (config_t *)malloc(sizeof(config_t));
+    if (read_cli_config("config.txt", config) != 0) {
+        LOG(ERROR) << "Read config file failed.";
+        exit(EXIT_FAILURE);
+    }
     
     for (int i = 0; i < 2; ++i) {
       folly::SocketAddress localAddr("30.1." + std::to_string(i + 2) + ".100", 6666); // bind to different interface port
       localAddresses.push_back(localAddr);
     }
+
+    host_ = std::string(config->server_ip);
+    port_ = config->port;
 
     /*for (int i = 0; i < 2; ++i) {
       folly::SocketAddress localAddr("127.0.0.1", port_ + i); // bind to different interface port
@@ -861,15 +1034,63 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
         }
     }).detach();
 
+    /*Shm init*/
+    
+    const char *config_file = "srv.conf";
+    // Read configuration file
+    shm_config_t *shm_config = read_config(config_file);
+
+    // Initialize global shared memory
+    shm_init_global(*shm_config);
+
+    pthread_t shm_thread[MAX_CLIENTS], tcp_thread[MAX_CLIENTS];
+    client_info_t client_info[MAX_CLIENTS];
+
+     // 映射共享内存
+    void *ptr = alloc_shm("sem_r", sizeof(sem_t));
+    if(ptr == NULL){
+        LOG_ERROR(__func__, "Alloc sem_r shm failed.");
+        exit(EXIT_FAILURE);
+    }
+
+    sem_r = (sem_t *)ptr;
+
+    /*init sem_r(process-shared read data from shm, default value = 0)*/
+    if (sem_init(sem_r, 1, 0) == -1) {
+        perror("sem_r init failed");
+        exit(EXIT_FAILURE);
+    }
+
+    void *wptr = alloc_shm("sem_w", sizeof(sem_t));
+    if(wptr == NULL){
+        perror("Alloc sem_w shm failed.");
+        exit(EXIT_FAILURE);
+    }
+
+    sem_w = (sem_t *)wptr;
+
+    /*init sem_w(process-shared write data into shm, default value = 0)*/
+    if (sem_init(sem_w, 1, 0) == -1) {
+        perror("sem_w init failed");
+        exit(EXIT_FAILURE);
+    }
+    
+
     startDone_.wait();
 
+    client_info[0].sock = -1;
+    client_info[0].client_id = 0;
+    client_info[0].config = config;
+    client_info[0].shm_config = shm_config;
+    ReadDataFromShm(&client_info[0]);
+
     // loop until Ctrl+D
-    generateRequests(1);
+    //generateRequests(1);
 
     LOG(INFO) << "EchoClient stopping client";
   }
 
-  ~MdlwClient() override = default;
+  ~ShmMdlwClient() override = default;
 
  private:
 
@@ -947,6 +1168,10 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
   std::string frameLabel_;
   std::shared_ptr<CliConnection> connManager_;
   struct mptcp_sock* mptcp_sock_;
+  sem_t *sem_r{nullptr};
+  sem_t *sem_w{nullptr};
+  uint64_t request_shm_counts_{0};
+  uint64_t response_shm_counts_{0};
 };
 
 } // namespace quic::samples

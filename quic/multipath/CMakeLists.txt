@@ -7,6 +7,9 @@ if(NOT BUILD_TESTS)
   return()
 endif()
 
+set(SHM_INCLUDE_DIR ../../shm/shm/include)
+set(SHM_LIBRARIES ../../shm/shm/lib)
+
 file(
   GLOB_RECURSE QUIC_API_HEADERS_TOINSTALL
   RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}
@@ -20,6 +23,18 @@ endforeach()
 
 add_executable(mdlw mdlw/main.cpp)
 
+target_include_directories(
+  mdlw 
+  PRIVATE
+  ${SHM_INCLUDE_DIR}
+)
+
+target_link_directories(
+  mdlw 
+  PRIVATE
+  ${SHM_LIBRARIES}
+)
+
 target_compile_options(
   mdlw
   PRIVATE
@@ -31,4 +46,5 @@ target_link_libraries(
   mvfst_test_utils
   ${GFLAGS_LIBRARIES}
   ${LIBGMOCK_LIBRARIES}
+  shm
 )

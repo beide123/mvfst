@@ -293,6 +293,14 @@ class ConnectionManager {
 
   virtual uint64_t getsize() = 0;
 
+  void setShmSocket(int64_t shm_sock) {
+    shm_sock_ = shm_sock;
+  }
+
+  int64_t getShmSocket() {
+    return shm_sock_;
+  }
+
   // Build clientStreams_ mapping
   void buildClientStreamsMap(int64_t connectionId, StreamId stream_id) {
     if (clientStreams_.find(connectionId) == clientStreams_.end()) {
@@ -439,6 +447,7 @@ class ConnectionManager {
 
  protected:
   uint64_t capacity_;
+  int64_t shm_sock_{-1};
   std::unordered_map<int64_t, StreamId> clientStreams_;
   std::unordered_map<uint64_t, std::shared_ptr<QuicSocket::ChunkData>> chunkCache_;
   
@@ -602,7 +611,7 @@ public:
                  << " last ack: " << lastAck.time_since_epoch().count() 
                  << " idle duration ms: " << idle_duration_ms.count();
                  
-        const uint64_t maxIdleTimeMs = 1000; 
+        const uint64_t maxIdleTimeMs = 1000 * 60; 
         if (idle_duration_ms.count() > maxIdleTimeMs) {
             LOG(ERROR) << "Subflow " << id << " inactive for too long (" << idle_duration_ms.count() << "ms)";
             return false;

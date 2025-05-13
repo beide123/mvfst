@@ -279,6 +279,14 @@ class QuicServerTransport
   const WrappedSocketObserverContainer wrappedObserverContainer_;
 };
 
+typedef struct {
+    char server_ip[16];
+    int port;
+    int packet_length;
+    int test_duration;
+    int conn_num;
+} config_t;
+
 class SrvConnection : public ConnectionManager {
  public:
   virtual ~SrvConnection() override = default;
