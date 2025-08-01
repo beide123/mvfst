@@ -184,6 +184,11 @@ public:
         struct sock *choose_sk = NULL;
         int16_t num_subs = 0, full_subs = 0, choose_sk_id = -1;
 
+restart:
+        num_subs = 0;
+        full_subs = 0;
+        choose_sk = NULL;
+        choose_sk_id = -1;
         /* pick the subflow with the lower wmem/wspace ratio */
         for (i = 0; i < SSK_MODE_MAX; ++i) {
             send_info[i].ssk = NULL;
@@ -224,10 +229,11 @@ public:
                 struct rrsched_priv *rr_p = rrsched_get_priv(subflow);
 			    rr_p->quota = 0;
             }
+            goto restart;
         }
 
 found:
-        VLOG(1) << "RoundRobinScheduler choose subflow " << choose_sk_id;
+        VLOG(2) << "RoundRobinScheduler choose subflow " << choose_sk_id;
         return choose_sk;
     }
 

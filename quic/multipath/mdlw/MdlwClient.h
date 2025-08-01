@@ -74,6 +74,19 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     LOG(INFO) << "EchoClient readAvailable streamId=" << streamId;
   }
 
+  void SendDataToApp(const char* data, size_t dataLength) {
+    if(!outputFile_){
+      outputFile_ = std::make_unique<std::ofstream>(filePath_, std::ios::app | std::ios::binary);
+    }
+    if (outputFile_ && outputFile_->is_open()) {
+        outputFile_->write(data, dataLength);
+        VLOG(1) << "Writing " << dataLength << " bytes to file : " << filePath_;
+        outputFile_->flush();
+    } else {
+        std::cerr << "Error: Unable to open file for writing." << std::endl;
+    }
+  }
+
   void writeDataToFile(const char* chunk, size_t dataLength, const std::string& filePath) {
     std::ofstream outputFile(filePath, std::ios::app | std::ios::binary);
     if (outputFile.is_open()) {
@@ -90,7 +103,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     for(size_t i = tail.length(); i > 0; i--){
       if(len >= i && data.substr(len-i) == tail.substr(0, i)){
         pos = len - i;
-        connManager_->setIncompFrameLen(connId, i);
+        connManager_->setIncompFrameLabelLen(connId, i);
         VLOG(1) << "Check tail has incomp frame, connId = " << connId
             << ", len = " << len
             << ", data = " << data.substr(len-i);
@@ -101,7 +114,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
   }
 
   bool isHeadMergeToFrame(const std::string& data, int64_t connId, size_t& left){
-    size_t incompFrameLen = connManager_->getIncompFrameLen(connId);
+    size_t incompFrameLen = connManager_->getIncompFrameLabelLen(connId);
     
     std::string head = frameLabel_;
     size_t headLen = head.length(), leftLen = headLen - incompFrameLen;
@@ -411,7 +424,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
 
       size_t start = 0, pos = 0, str_len = strlen(frameLabel_.c_str()), left = 0;
 
-      if(connManager_->isIncompleteFrame(connId)){
+      if(connManager_->isIncompleteFrameLabel(connId)){
         //Check if the head can merge to frame label "FRAME"
         if(isHeadMergeToFrame(currentData, connId, start)){
           //Merge successfully, find the next frame header position
@@ -421,7 +434,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
               VLOG(1) << "Process frame head merge to frame, connId = " << connId
                       << ", start = " << start << ", pos = " << pos;
               processHeaderfield(connId, originalData + start, pos - start, filePath);
-              connManager_->removeIncompFrameLen(connId);
+              connManager_->removeIncompFrameLabelLen(connId);
               start = pos;
           } else {
               // Not found "Frame", choose the processing function based on tail completion
@@ -433,16 +446,16 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
                   VLOG(1) << "Process frame head merge without tail, connId = " << connId
                           << ", start = " << start << ", pos = " << pos;
                   processHeaderfield(connId, originalData + start, dataLength - start, filePath);
-                  connManager_->removeIncompFrameLen(connId);
+                  connManager_->removeIncompFrameLabelLen(connId);
                   start = dataLength;
               }
           }
         }else{
           //Merge failed, write the last stored string into file
-          size_t lastLen = connManager_->getIncompFrameLen(connId);
+          size_t lastLen = connManager_->getIncompFrameLabelLen(connId);
           const char* last = frameLabel_.c_str();
           processDatafield(connId, last, lastLen, filePath);
-          connManager_->removeIncompFrameLen(connId);
+          connManager_->removeIncompFrameLabelLen(connId);
         }
       }
     
@@ -452,7 +465,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
         if(pos != std::string::npos){
             if(pos > start){
                 //Process data ahead of the next frame header
-                if(connManager_->hasImcomp(connId)){
+                if(connManager_->hasImcompSeqOrLen(connId)){
                   //Process Frame header with imcomplete sequence number or offset
                   processHeaderfield(connId, originalData + start, pos - start, filePath);
                 }else{
@@ -480,7 +493,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
             }
             //Process the data next frame header
             processHeaderfield(connId, originalData + start, nxt_pos - start, filePath);
-            if(connManager_->isIncompleteFrame(connId)){
+            if(connManager_->isIncompleteFrameLabel(connId)){
               start = dataLength;
             }else{
               start = nxt_pos;
@@ -495,7 +508,7 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
             start = dataLength;
         }else{
             //No Frame labelor tail, just process the data
-            if(connManager_->hasImcomp(connId)){
+            if(connManager_->hasImcompSeqOrLen(connId)){
               //Process the data with imcomplete sequence number or offset
               processHeaderfield(connId, originalData + start, dataLength - start, filePath);
             }else{
@@ -520,22 +533,30 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     auto current = data->cloneCoalescedAsValue();
     size_t dataLength = current.length();
     
-    std::string filePath = "./" + fileName_;
-    std::ofstream file(filePath, std::ios::binary | std::ios::app);
-    if (!file) {
-      LOG(ERROR) << "Failed to create file: " << filePath;
-      return;
-    }
+    filePath_ = "./" + fileName_;
+    
     if (recvOffsets_.find(connId) == recvOffsets_.end() || recvOffsets_[connId].find(streamId) == recvOffsets_[connId].end()) {
         recvOffsets_[connId][streamId] = 0; 
     }
+
+    const char* active = (const char*)current.data();
+
+    if (memcmp(active, "HTTP/1.1", 8) == 0) {
+      LOG(INFO) << "HTTP/1.1 response received";
+      size_t ac_header_len = strlen("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+      activePath_[connId] = true;
+      active += ac_header_len;
+      dataLength -= ac_header_len;
+    }
+    
     if (dataLength > 0) {
-        auto dataCopy = std::make_shared<folly::IOBuf>(std::move(current));
+        auto dataCopy = folly::IOBuf::copyBuffer(active, dataLength);
         VLOG(2) << "Read available data= " << dataCopy->toString();
+
         connManager_->getEventBase()->runInEventBaseThread(
-          [this, dataCopy, dataLength, connId, filePath]() {
-            VLOG(2) << "Merge data is " << dataCopy->toString();
-            mergeData(dataCopy.get(), dataLength, connId, filePath);
+          [this, data = std::move(dataCopy), dataLength, connId]() {
+            VLOG(2) << "Merge data is " << data->toString();
+            connManager_->mergeData(data.get(), dataLength, connId, frameLabel_);
           });
         
         recvOffsets_[connId][streamId] += dataLength;
@@ -770,12 +791,17 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     auto mev = mergeDataThread.getEventBase();
     auto mEvb = std::make_shared<FollyQuicEventBase>(mev);
 
-    connManager_ = std::make_shared<CliConnection>(100, mEvb);
+    connManager_ = std::make_shared<CliConnection>();
+    connManager_->setEventBase(mEvb);
     mptcp_sock_ = new struct mptcp_sock();
     mptcp_sock_->connManager = connManager_;
-    fileName_ = "CHUNK_1000K.mp4";
+    fileName_ = "dlw_1g.txt";
     frameLabel_ = "FRAME";
+    
     connManager_->setScheduler("rr", mptcp_sock_);
+    connManager_->setDataCallback([this](const char* data, size_t dataLength) {
+      this->SendDataToApp(data, dataLength);
+    });
 
     std::vector<folly::SocketAddress> localAddresses; // store different local addresses
     
@@ -945,6 +971,8 @@ class MdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
   std::string clientKeyPath_;
   std::string fileName_;
   std::string frameLabel_;
+  std::string filePath_;
+  std::unique_ptr<std::ofstream> outputFile_;
   std::shared_ptr<CliConnection> connManager_;
   struct mptcp_sock* mptcp_sock_;
 };

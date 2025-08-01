@@ -19,8 +19,158 @@
 
 namespace quic {
 
+struct Gap {
+    uint64_t begin;
+    uint64_t end;
+    bool operator<(const Gap& o) const { return begin < o.begin; }
+};
+
+// 单生产者单消费者环形缓冲区
+template<typename T>
+class RingBuffer {
+private:
+    std::vector<T> buffer_;
+    size_t head_{0};
+    size_t tail_{0};
+    size_t size_{0};
+    size_t capacity_;
+    uint64_t expected_ = 0;          // 逻辑上的“起始序号”
+    std::set<Gap> gaps_;             // 释放的区间
+    
+public:
+    explicit RingBuffer(size_t capacity) 
+        : buffer_(capacity), capacity_(capacity) {
+        // 预分配内存，确保 vector 有足够的空间
+        buffer_.reserve(capacity);
+        buffer_.resize(capacity); // 确保内存被实际分配和初始化
+    }
+    
+    std::pair<T*, size_t> allocate(size_t n) {
+        if (n > capacity_ || size_ + n > capacity_) return {nullptr, 0};
+        size_t my_offset = 0;
+        T* result = nullptr;
+        if (tail_ >= head_) {
+            // Case 1: head is behind tail. Free space is at the end and start.
+            if (tail_ + n <= capacity_) {
+                // Enough space at the end
+                result = &buffer_[tail_];
+                my_offset = tail_;
+                tail_ = (tail_ + n) % capacity_;
+                size_ += n;
+                return {result, my_offset};
+            } else if (n <= head_) {
+                // Not enough space at the end, but enough at the beginning.
+                // We will jump to the start, and mark the wasted space at the end
+                // as a 'gap' that is logically freed.
+                size_ += capacity_ - tail_;
+                unordered_release(tail_, capacity_ - tail_);
+
+                // Now allocate from the beginning
+                tail_ = 0;
+                result = &buffer_[tail_];
+                my_offset = tail_;
+                tail_ += n;
+                size_ += n;
+                return {result, my_offset};
+            }
+        } else {
+            // Case 2: tail is behind head. Free space is between them.
+            if (tail_ + n < head_) {
+                result = &buffer_[tail_];
+                my_offset = tail_;
+                tail_ += n;
+                size_ += n;
+                return {result, my_offset};
+            }
+        }
+        return {nullptr, 0};
+    }
+
+
+    void unordered_release(uint64_t offset, size_t length) {
+        uint64_t begin = offset;
+        uint64_t end   = offset + length;
+
+        auto it = gaps_.lower_bound({begin, end});
+
+        // check left gap if has overlapping with current gap
+        if (!gaps_.empty() && it != gaps_.begin()) {
+            auto prev = std::prev(it);
+            if (prev->end > begin) {
+                // has overlapping, abort
+                LOG(ERROR) << "FATAL: overlapping free! [" << begin << ", " << end << ") & [" << prev->begin << ", " << prev->end << ")\n";
+                abort();
+            }
+        }
+        // check right gap (only adjacent)
+        if (it != gaps_.end() && it->begin < end) {
+            LOG(ERROR) << "FATAL: overlapping free! [" << begin << ", " << end << ") & [" << it->begin << ", " << it->end << ")\n";
+            abort();
+        }
+
+        // merge left adjacent
+        if (!gaps_.empty() && it != gaps_.begin() && std::prev(it)->end == begin) {
+            auto prev = std::prev(it);
+            begin = prev->begin;
+            gaps_.erase(prev);
+        }
+        // merge right adjacent
+        if (it != gaps_.end() && it->begin == end) {
+            end = it->end;
+            gaps_.erase(it);
+        }
+
+        gaps_.insert({begin, end});
+
+        // auto-advance push head_
+        while (!gaps_.empty()) {
+            auto i2 = gaps_.begin();
+            if (i2->begin != expected_) break;
+            uint64_t nextExp = i2->end;
+            deallocate(nextExp - expected_);
+            expected_ = nextExp % capacity_;
+            gaps_.erase(i2);
+        }
+    }
+    
+    void deallocate(size_t n) {
+        if (n > size_) {
+            // This can happen if we are releasing a gap created by a jump.
+            // In that case, size_ is not reflective of the logical space.
+            // We trust the gap logic.
+            VLOG(1) << "Free the tail gap" << n << "bytes in size_ " << size_;
+        } else {
+             size_ -= n;
+        }
+        head_ = (head_ + n) % capacity_;
+    }
+
+    void print_buffer_state() {
+        LOG(ERROR) << "Buffer state: "
+                << "head = " << head_ << ", "
+                << "tail = " << tail_ << ", "
+                << "size = " << size_ << ", "
+                << "capacity = " << capacity_ << ", "
+                << "gaps = " << gaps_.size() << ", "
+                << "expected = " << expected_;
+        for(auto& gap : gaps_){
+            LOG(ERROR) << "gap = [" << gap.begin << ", " << gap.end << ")";
+        }
+    }
+    
+    size_t get_capacity() const { return capacity_; }
+    size_t get_used_count() const { return size_; }
+    bool empty() const { return size_ == 0; }
+    bool full() const { return size_ == capacity_; }
+    
+    size_t get_head()      const { return head_; }
+    size_t get_tail()      const { return tail_; }
+    uint64_t get_head_seq() const { return expected_; }
+};
+
 class QuicSocketLite {
  public:
+
   /**
    * Information about the transport, similar to what TCP has.
    */
@@ -79,6 +229,144 @@ class QuicSocketLite {
   };
 
   typedef struct ChunkWithSequenceData {
+    uint64_t sequenceNumber;
+    size_t total;
+    size_t offset;
+    std::shared_ptr<char[]> data;  // 使用原始指针，由内存池管理// 静态内存池
+    RingBuffer<char>& shmPool_;
+  
+    ChunkWithSequenceData(uint64_t sequenceNumber, size_t total, size_t offset, RingBuffer<char>& shmPool, const char* rawData) : 
+        sequenceNumber(sequenceNumber), 
+        total(total), 
+        offset(offset),
+        shmPool_(shmPool)
+    {
+        if (rawData && total > 0) {
+            auto pair = shmPool_.allocate(total);
+            char* allocated = pair.first;
+            size_t my_offset = pair.second;
+            if (allocated) {
+                memcpy(allocated, rawData, offset); 
+                data = std::shared_ptr<char[]>(allocated, [this, total, my_offset](char* ptr) {
+                    // self-defined deleter
+                    if (ptr) {
+                        VLOG(1) << "release data at offset " << my_offset << " with size " << total;
+                        shmPool_.unordered_release(my_offset, total); // 只传递 total 大小
+                    }
+                });
+            } else {
+                data = nullptr;
+                shmPool_.print_buffer_state();
+            }
+        } else {
+            data = nullptr;
+            VLOG(1) << "rawData is nullptr";
+        }
+    }
+  
+    ChunkWithSequenceData(const ChunkWithSequenceData& other)
+        : sequenceNumber(other.sequenceNumber),
+          total(other.total),
+          offset(other.offset),
+          shmPool_(other.shmPool_) {
+        if (other.data && total > 0) {
+            auto pair = shmPool_.allocate(total);
+            char* allocated = pair.first;
+            size_t my_offset = pair.second;
+            if (allocated) {
+                memcpy(allocated, other.data.get(), offset); // 修正为 total
+                size_t total_size = total; // 创建局部变量
+                data = std::shared_ptr<char[]>(allocated, [this, total_size, my_offset](char* ptr) {
+                    // self-defined deleter
+                    if (ptr) {
+                        shmPool_.unordered_release(my_offset, total_size); 
+                    }
+                });
+            } else {
+                data = nullptr;
+            }
+        } else {
+            data = nullptr;
+        }
+    }
+  
+    ChunkWithSequenceData& operator=(const ChunkWithSequenceData& other) {
+        if (this != &other) {
+            sequenceNumber = other.sequenceNumber;
+            offset = other.offset;
+            total = other.total;
+            shmPool_ = other.shmPool_;
+            if (other.data && total > 0) {
+                auto pair = shmPool_.allocate(total);
+                char* allocated = pair.first;
+                size_t my_offset = pair.second;
+                if (allocated) {
+                    memcpy(allocated, other.data.get(), offset); // 修正为 total
+                    size_t total_size = total; 
+                    data = std::shared_ptr<char[]>(allocated, [this, total_size, my_offset](char* ptr) {
+                        if (ptr) {
+                            shmPool_.unordered_release(my_offset, total_size); 
+                        }
+                    });
+                } else {
+                    data = nullptr;
+                }
+            } else {
+                data = nullptr;
+            }
+        }
+        return *this;
+    }
+  
+    ChunkWithSequenceData(ChunkWithSequenceData&& other) noexcept
+        : sequenceNumber(other.sequenceNumber),
+          total(other.total),
+          offset(other.offset),
+          shmPool_(other.shmPool_),
+          data(other.data)
+    {
+        other.data = nullptr;
+        other.total = 0;
+        other.offset = 0;
+        other.sequenceNumber = 0;
+    }
+  
+    ChunkWithSequenceData& operator=(ChunkWithSequenceData&& other) noexcept {
+        if (this != &other) {
+            sequenceNumber = other.sequenceNumber;
+            total = other.total;
+            offset = other.offset;
+            shmPool_ = other.shmPool_;
+            data = other.data;
+            
+            other.data = nullptr;
+            other.total = 0;
+            other.offset = 0;
+            other.sequenceNumber = 0;
+        }
+        return *this;
+    }
+  
+    inline void reset() noexcept {
+        offset = 0;
+        total  = 0;
+        sequenceNumber = 0;
+    }
+  
+    ~ChunkWithSequenceData() = default;
+  
+  }ChunkData;
+  
+  class ChunkWithSequence {
+    public:
+  
+    virtual ~ChunkWithSequence() = default;
+  
+    private:
+    ChunkData data_; 
+  };
+
+  /*typedef struct ChunkWithSequenceData {
       uint64_t sequenceNumber;
       size_t total;
       size_t offset;
@@ -127,15 +415,7 @@ class QuicSocketLite {
       }
       
   } ChunkData;
-
-  class ChunkWithSequence {
-   public:
-
-    virtual ~ChunkWithSequence() = default;
-
-   private:
-    ChunkData data_; 
-  };
+  */
 
   /**
    * Callback for connection set up events.

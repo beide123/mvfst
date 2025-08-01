@@ -45,31 +45,11 @@ int read_srv_config(const char *filename, config_t *config) {
     }
 
     // 解析配置文件
-    if (fscanf(file, "server_ip=%15s\n", config->server_ip) != 1) {
-        perror("Failed to parse 'server_ip' from config file");
-        fclose(file);
-        return -1;
-    }
-    if (fscanf(file, "port=%d\n", &config->port) != 1) {
-        perror("Failed to parse 'port' from config file");
-        fclose(file);
-        return -1;
-    }
-    if (fscanf(file, "packet_length=%d\n", &config->packet_length) != 1) {
-        perror("Failed to parse 'packet_length' from config file");
-        fclose(file);
-        return -1;
-    }
-    if (fscanf(file, "test_duration=%d\n", &config->test_duration) != 1) {
-        perror("Failed to parse 'test_duration' from config file");
-        fclose(file);
-        return -1;
-    }
-    if (fscanf(file, "conn_num=%d\n", &config->conn_num) != 1) {
-        perror("Failed to parse 'conn_num' from config file");
-        fclose(file);
-        return -1;
-    }
+    fscanf(file, "server_ip=%15s\n", config->server_ip);
+    fscanf(file, "port=%d\n", &config->port);
+    fscanf(file, "packet_length=%d\n", &config->packet_length);
+    fscanf(file, "test_duration=%d\n", &config->test_duration);
+    fscanf(file, "conn_num=%d\n", &config->conn_num);
 
     fclose(file);
     return 0;

@@ -115,10 +115,15 @@ class CliConnection : public ConnectionManager {
  public:
   virtual ~CliConnection() override = default;
 
-  CliConnection(uint64_t capacity, std::shared_ptr<FollyQuicEventBase> fEvb) : ConnectionManager(capacity) {
-    fEvb_ = fEvb;
+  CliConnection() : ConnectionManager() {
+    capacity_ = 100;
     connections_ = std::unordered_map<int64_t, std::shared_ptr<QuicClientTransport>>();
   }
+
+  void setEventBase(std::shared_ptr<FollyQuicEventBase> fEvb) {
+    fEvb_ = fEvb;
+  }
+
   // Add connection
   void addConnection(int64_t connectionId, std::shared_ptr<QuicClientTransport> connection) {
     if (connectionId > -1) {

@@ -31,7 +31,7 @@
 #include <quic/common/test/TestUtils.h>
 #include <quic/common/udpsocket/FollyQuicAsyncUDPSocket.h>
 #include <quic/fizz/client/handshake/FizzClientQuicHandshakeContext.h>
-#include <quic/shm_mp/shmdlw/LogQuicStats.h>
+#include <quic/opv_shm/opvshm/LogQuicStats.h>
 
 #include <shm_sock.h>
 
@@ -39,13 +39,13 @@
 #define BUFFER_SIZE 1024
 #define MAX_CLIENTS 100
 
-
-namespace quic::shm_mp {
+namespace quic::opv_shm {
 
 constexpr size_t kNumTestStreamGroups = 2;
 
 size_t fileCounter = 0;
 
+// Now define ShmMdlwClient
 class ShmMdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
                    public quic::QuicSocket::ConnectionCallback,
                    public quic::QuicSocket::ReadCallback,
@@ -96,6 +96,27 @@ class ShmMdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
       char recv_buff[BUFFER_SIZE];
   } client_info_t;
 
+  
+  class LocalFifoEventHandler : public folly::EventHandler {
+  public:
+      // 构造函数接收原始的 folly::EventBase* 和一个指向其外部 ShmMdlwClient 实例的指针
+      LocalFifoEventHandler(folly::EventBase* evb, ShmMdlwClient* owner)
+          : folly::EventHandler(evb), ownerClient_(owner) { // 直接使用 evb 初始化基类
+          CHECK(evb);
+          CHECK(ownerClient_);
+      }
+
+      void handlerReady(uint16_t events) noexcept override {
+          if (events & folly::EventHandler::READ) {
+              CHECK(ownerClient_);
+              ownerClient_->handleShmFifoEvent();
+          }
+      }
+
+  private:
+      ShmMdlwClient* ownerClient_;
+  };
+
   void readAvailable(quic::StreamId streamId) noexcept override {
     LOG(INFO) << "EchoClient readAvailable streamId=" << streamId;
   }
@@ -103,34 +124,85 @@ class ShmMdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
   int read_cli_config(const char *filename, config_t *config) {
     FILE *file = fopen(filename, "r");
     if (file == NULL) {
-        LOG_ERROR(__func__, "Failed to open config file");
+        LOG(ERROR) << "Failed to open config file: " << filename;
         return -1;
     }
 
     // 解析配置文件
-    fscanf(file, "server_ip=%15s\n", config->server_ip);
-    fscanf(file, "port=%d\n", &config->port);
-    fscanf(file, "packet_length=%d\n", &config->packet_length);
-    fscanf(file, "test_duration=%d\n", &config->test_duration);
-    fscanf(file, "conn_num=%d\n", &config->conn_num);
+    if (fscanf(file, "server_ip=%15s\n", config->server_ip) != 1) {
+        LOG(ERROR) << "Failed to parse 'server_ip' from " << filename;
+        fclose(file);
+        return -1;
+    }
+    if (fscanf(file, "port=%hu\n", &config->port) != 1) {
+        LOG(ERROR) << "Failed to parse 'port' from " << filename;
+        fclose(file);
+        return -1;
+    }
+    if (fscanf(file, "packet_length=%d\n", &config->packet_length) != 1) {
+        LOG(ERROR) << "Failed to parse 'packet_length' from " << filename;
+        fclose(file);
+        return -1;
+    }
+    if (fscanf(file, "test_duration=%d\n", &config->test_duration) != 1) {
+        LOG(ERROR) << "Failed to parse 'test_duration' from " << filename;
+        fclose(file);
+        return -1;
+    }
+    if (fscanf(file, "conn_num=%d\n", &config->conn_num) != 1) {
+        LOG(ERROR) << "Failed to parse 'conn_num' from " << filename;
+        fclose(file);
+        return -1;
+    }
 
     fclose(file);
     return 0;
   }
 
   void writeDataToFile(const char* chunk, size_t dataLength, const std::string& filePath) {
-    size_t bytesWritten = 0;
-    int64_t shm_sock = connManager_->getShmSocket();
-    bytesWritten = shm_write(shm_sock, chunk, dataLength);
-    if(bytesWritten != dataLength){
-      LOG(ERROR) << "Write data to shm failed, bytesWritten = " << bytesWritten
-                 << ", dataLength = " << dataLength;
-      exit(1);
+    // filePath parameter is currently unused in SHM context.
+    if (!client_info_ || client_info_->shm_sock < 0) {
+        LOG(ERROR) << "writeDataToFile: client_info_ or shm_sock is invalid.";
+        return;
     }
-    // 使用事件通知替代信号量
+
+    ssize_t bytesWrittenToShm = shm_write(client_info_->shm_sock, chunk, dataLength);
+    if (bytesWrittenToShm < 0) {
+      LOG(ERROR) << "writeDataToFile: shm_write failed: " << strerror(errno);
+      return;
+    }
+    if (static_cast<size_t>(bytesWrittenToShm) != dataLength) {
+      LOG(ERROR) << "writeDataToFile: Partial shm_write. Wrote " << bytesWrittenToShm << " out of " << dataLength;
+      return;
+    }
+
+    std::atomic_thread_fence(std::memory_order_release);
+
+    VLOG(1) << "writeDataToFile: Successfully wrote " << bytesWrittenToShm << " bytes to SHM socket " << client_info_->shm_sock;
+
+    // Notify the SHM client via the persistently open FIFO (shm_write_fd_)
+    if (shm_write_fd_ == -1) { // 检查文件描述符是否有效
+        LOG(ERROR) << "writeDataToFile: shm_write_fd_ is invalid. Cannot write notification to sc_fifo: " << shm_fifo_write_;
+        return;
+    }
+    
+    *notify_buffer_ = bytesWrittenToShm; // Actual byte value doesn't matter
+    ssize_t written_to_fifo = ::write(shm_write_fd_, notify_buffer_, sizeof(ssize_t));
+    if (written_to_fifo == -1) {
+        LOG(ERROR) << "writeDataToFile: Failed to write notification to sc_fifo (fd: " << shm_write_fd_ 
+                   << ", path: " << shm_fifo_write_ << "): " << strerror(errno);
+        // If EPIPE, the read end of the pipe was closed. Consider closing and reopening shm_write_fd_ on next attempt.
+        // For now, just log the error.
+    } else {
+        VLOG(1) << "writeDataToFile: Successfully wrote notification to sc_fifo (fd: " << shm_write_fd_ 
+                << ", path: " << shm_fifo_write_ << ")";
+    }
+    
+    /*
     connManager_->getEventBase()->runInEventBaseThread([this]() {
       sem_post(sem_r);
     });
+    */
   }
 
   bool isTailHasIncompFrame(const std::string& data, int64_t connId, size_t len, size_t& pos){
@@ -139,7 +211,7 @@ class ShmMdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     for(size_t i = tail.length(); i > 0; i--){
       if(len >= i && data.substr(len-i) == tail.substr(0, i)){
         pos = len - i;
-        connManager_->setIncompFrameLen(connId, i);
+        connManager_->setIncompFrameLabelLen(connId, i);
         VLOG(1) << "Check tail has incomp frame, connId = " << connId
             << ", len = " << len
             << ", data = " << data.substr(len-i);
@@ -150,18 +222,18 @@ class ShmMdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
   }
 
   bool isHeadMergeToFrame(const std::string& data, int64_t connId, size_t& left){
-    size_t incompFrameLen = connManager_->getIncompFrameLen(connId);
+    size_t incompFrameLabelLen = connManager_->getIncompFrameLabelLen(connId);
     
     std::string head = frameLabel_;
-    size_t headLen = head.length(), leftLen = headLen - incompFrameLen;
+    size_t headLen = head.length(), leftLen = headLen - incompFrameLabelLen;
 
     VLOG(1) << "Check if head merge to frame, connId = " << connId
-            << ", incompFrameLen = " << incompFrameLen
+            << ", incompFrameLabelLen = " << incompFrameLabelLen
             << ", left = " << left
             << ", data = " << data.substr(0, leftLen);
     
-    if(incompFrameLen > 0 && incompFrameLen < headLen){
-      std::string prefix = head.substr(0, incompFrameLen);
+    if(incompFrameLabelLen > 0 && incompFrameLabelLen < headLen){
+      std::string prefix = head.substr(0, incompFrameLabelLen);
       if(prefix + data.substr(0, leftLen) == head){
         left = leftLen;
         VLOG(1) << "Can merge head to frame, connId = " << connId
@@ -460,7 +532,7 @@ class ShmMdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
 
       size_t start = 0, pos = 0, str_len = strlen(frameLabel_.c_str()), left = 0;
 
-      if(connManager_->isIncompleteFrame(connId)){
+      if(connManager_->isIncompleteFrameLabel(connId)){
         //Check if the head can merge to frame label "FRAME"
         if(isHeadMergeToFrame(currentData, connId, start)){
           //Merge successfully, find the next frame header position
@@ -470,7 +542,7 @@ class ShmMdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
               VLOG(1) << "Process frame head merge to frame, connId = " << connId
                       << ", start = " << start << ", pos = " << pos;
               processHeaderfield(connId, originalData + start, pos - start, filePath);
-              connManager_->removeIncompFrameLen(connId);
+              connManager_->removeIncompFrameLabelLen(connId);
               start = pos;
           } else {
               // Not found "Frame", choose the processing function based on tail completion
@@ -482,16 +554,16 @@ class ShmMdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
                   VLOG(1) << "Process frame head merge without tail, connId = " << connId
                           << ", start = " << start << ", pos = " << pos;
                   processHeaderfield(connId, originalData + start, dataLength - start, filePath);
-                  connManager_->removeIncompFrameLen(connId);
+                  connManager_->removeIncompFrameLabelLen(connId);
                   start = dataLength;
               }
           }
         }else{
           //Merge failed, write the last stored string into file
-          size_t lastLen = connManager_->getIncompFrameLen(connId);
+          size_t lastLen = connManager_->getIncompFrameLabelLen(connId);
           const char* last = frameLabel_.c_str();
           processDatafield(connId, last, lastLen, filePath);
-          connManager_->removeIncompFrameLen(connId);
+          connManager_->removeIncompFrameLabelLen(connId);
         }
       }
     
@@ -501,7 +573,7 @@ class ShmMdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
         if(pos != std::string::npos){
             if(pos > start){
                 //Process data ahead of the next frame header
-                if(connManager_->hasImcomp(connId)){
+                if(connManager_->hasImcompSeqOrLen(connId)){
                   //Process Frame header with imcomplete sequence number or offset
                   processHeaderfield(connId, originalData + start, pos - start, filePath);
                 }else{
@@ -529,7 +601,7 @@ class ShmMdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
             }
             //Process the data next frame header
             processHeaderfield(connId, originalData + start, nxt_pos - start, filePath);
-            if(connManager_->isIncompleteFrame(connId)){
+            if(connManager_->isIncompleteFrameLabel(connId)){
               start = dataLength;
             }else{
               start = nxt_pos;
@@ -544,7 +616,7 @@ class ShmMdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
             start = dataLength;
         }else{
             //No Frame labelor tail, just process the data
-            if(connManager_->hasImcomp(connId)){
+            if(connManager_->hasImcompSeqOrLen(connId)){
               //Process the data with imcomplete sequence number or offset
               processHeaderfield(connId, originalData + start, dataLength - start, filePath);
             }else{
@@ -706,6 +778,96 @@ class ShmMdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
 
   }
 
+  void handleShmFifoEvent() {
+    LOG(INFO) << "handleShmFifoEvent triggered for fd: " << shm_listen_fd_;
+
+    // 1. 从通知 FIFO (shm_listen_fd_) 读取一个字节，以清除事件并确认通知。
+    char notify_buffer[1];
+    ssize_t bytes_read_from_fifo = ::read(shm_listen_fd_, notify_buffer, sizeof(notify_buffer));
+
+    if (bytes_read_from_fifo == -1) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // 非阻塞模式下，没有数据可读是正常的，但 EventHandler 通常在有数据时才触发。
+            // 这种情况可能不常发生，或者表示事件处理机制的某种边缘情况。
+            LOG(WARNING) << "handleShmFifoEvent: read from notification FIFO returned EAGAIN/EWOULDBLOCK on fd "
+                         << shm_listen_fd_ << ". This might be unexpected if handler was triggered for READ.";
+            // 通常在这种情况下，不需要立即做进一步处理，等待下一次事件。
+            return;
+        } else {
+            LOG(ERROR) << "handleShmFifoEvent: Error reading from notification FIFO fd " << shm_listen_fd_
+                       << ": " << strerror(errno) << " (errno: " << errno << ")";
+          
+            return;
+        }
+    } else if (bytes_read_from_fifo == 0) {
+        // FIFO 的写入端已关闭。这可能表示 SHM 客户端已终止。
+        LOG(INFO) << "handleShmFifoEvent: read 0 bytes from notification FIFO fd " << shm_listen_fd_
+                  << ", peer (SHM client) likely closed the write end of the FIFO.";
+        // 在这里，您可能需要执行一些清理操作，例如关闭 shm_sock，
+        // 注销 EventHandler，或者通知 ShmMdlwClient 的其他部分连接已断开。
+        // 例如：
+        if (shm_fifo_handler_ && shm_fifo_handler_->isHandlerRegistered()) {
+            shm_fifo_handler_->unregisterHandler();
+        }
+        // if (client_info_ && client_info_->shm_sock >= 0) {
+        //     LOG(INFO) << "Closing SHM socket " << client_info_->shm_sock << " due to FIFO EOF.";
+        //     ::close(client_info_->shm_sock);
+        //     client_info_->shm_sock = -1;
+        // }
+        // running_ = false; // 如果有全局运行标志
+        return;
+    } else {
+        // 成功从 FIFO 读取到通知字节。
+        VLOG(1) << "handleShmFifoEvent: Successfully read " << bytes_read_from_fifo 
+                << " byte(s) from notification FIFO fd " << shm_listen_fd_ << ". Proceeding to read from SHM.";
+    }
+    
+    // 检查 client_info_ 和 shm_sock 是否有效
+    if (!client_info_ || client_info_->shm_sock < 0) {
+        LOG(ERROR) << "handleShmFifoEvent: client_info_ or client_info_->shm_sock is invalid. Cannot read from SHM.";
+        return;
+    }
+
+    // --- 开始原 ReadDataFromShm() 的核心逻辑 (单次执行版本) ---
+    VLOG(1) << "handleShmFifoEvent: Attempting to read data from SHM socket " << client_info_->shm_sock;
+    
+    // 清空接收缓冲区 (或者在 ReadDataFromShm 内部处理)
+    // 清空接收缓冲区 (或者在 ReadDataFromShm 内部处理)
+    memset(client_info_->recv_buff, 0, sizeof(client_info_->recv_buff)); 
+
+    size_t headerSize = strlen("FRAME") + sizeof(uint64_t) + sizeof(size_t);
+    auto sequenceNumber = connManager_->getSequenceNumber();
+    memcpy(client_info_->recv_buff, "FRAME", strlen("FRAME"));
+    memcpy(client_info_->recv_buff + strlen("FRAME"), &sequenceNumber, sizeof(uint64_t));
+
+    char* rspbuf = client_info_->recv_buff + headerSize;
+
+    size_t len = *recv_length_;
+
+    ssize_t bytes_read_from_shm = shm_read(client_info_->shm_sock, rspbuf, len); // -1 for null terminator
+
+    if (bytes_read_from_shm < 0) {
+        LOG(ERROR) << "handleShmFifoEvent: shm_read from socket " << client_info_->shm_sock << " failed: " << strerror(errno);
+        // 这里可能也需要错误处理，比如关闭连接
+        return;
+    } else if (bytes_read_from_shm == 0) {
+        LOG(INFO) << "handleShmFifoEvent: shm_read 0 bytes from socket " << client_info_->shm_sock << ". SHM Client might have closed connection.";
+        // 处理连接关闭的情况
+        return;
+    }
+
+    memcpy(client_info_->recv_buff + strlen("FRAME") + sizeof(uint64_t), &bytes_read_from_shm, sizeof(size_t));
+
+    client_info_->recv_buff[headerSize + bytes_read_from_shm] = '\0'; // 确保字符串结束
+    VLOG(1) << "handleShmFifoEvent: Read " << bytes_read_from_shm << " bytes from SHM: " << client_info_->recv_buff;
+
+    scheduleRequests(client_info_->recv_buff, bytes_read_from_shm, request_shm_counts_);
+
+    connManager_->setSequenceNumber(sequenceNumber + 1);
+
+    VLOG(1) << "handleShmFifoEvent: Request scheduled based on data from SHM. Current request_shm_counts_: " << this->request_shm_counts_;
+  }
+
   bool activateConnections(){
     std::vector<int64_t> ConnIds = connManager_->getAllConnectionIds();
     for (auto& connId : ConnIds) {
@@ -746,7 +908,7 @@ class ShmMdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     return isAllActive;
   }
 
-  void scheduleRequests(char *request, std::chrono::steady_clock::time_point& start, uint64_t& i){
+  void scheduleRequests(const char *request, size_t req_len, uint64_t& i) {
     auto client_pair = connManager_->getBestConnection();
     auto connId = client_pair.first;
     auto client = client_pair.second;
@@ -755,16 +917,20 @@ class ShmMdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
       return;
     }
     auto streamId = connManager_->getClientStream(connId);
-    //LOG(INFO) << "Submitting task: index=" << i;
-    // Submit the send task to EventBaseThread
-    client->getEventBase()->runInEventBaseThread([this, request = std::move(request), connId, i, streamId]() {
-        // Save the request content to the pending send map
-        auto& pendingOutput_ = pendingOutputs_[connId];
-        pendingOutput_[streamId].append(folly::IOBuf::copyBuffer(request));
 
-        // Send the request
-        sendMessage(streamId, pendingOutput_[streamId], i, connId);
-    });
+    // Copy the buffer here with explicit length to avoid race condition and strlen issues.
+    auto data_to_send = folly::IOBuf::copyBuffer(request, req_len);
+
+    // Submit the send task to EventBaseThread
+    client->getEventBase()->runInEventBaseThread(
+        [this, data = std::move(data_to_send), connId, i, streamId]() mutable {
+          // Save the request content to the pending send map
+          auto& pendingOutput_ = pendingOutputs_[connId];
+          pendingOutput_[streamId].append(std::move(data));
+
+          // Send the request
+          sendMessage(streamId, pendingOutput_[streamId], i, connId);
+        });
     ++i;
   }
 
@@ -813,11 +979,26 @@ class ShmMdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     }
   }
 
-  void ReadDataFromShm(client_info_t *client_info){
-  
-    int cid = client_info->client_id;
-    config_t *config = client_info->config;
-    shm_config_t *shm_config = client_info->shm_config;
+  void AcceptShmConnection(){
+    if (!client_info_) {
+        LOG(ERROR) << "client_info_ is not initialized in AcceptShmConnection.";
+        // Consider exiting or throwing an exception if this is a fatal state
+        exit(EXIT_FAILURE); 
+        return;
+    }
+    if (!client_info_->config) {
+        LOG(ERROR) << "client_info_->config is not initialized in AcceptShmConnection.";
+        exit(EXIT_FAILURE);
+        return;
+    }
+    if (!client_info_->shm_config) {
+        LOG(ERROR) << "client_info_->shm_config is not initialized in AcceptShmConnection.";
+        exit(EXIT_FAILURE);
+        return;
+    }
+    int cid = client_info_->client_id;
+    config_t *config = client_info_->config;
+    shm_config_t *shm_config = client_info_->shm_config;
 
     int listen_fd = -1;
 
@@ -857,40 +1038,11 @@ class ShmMdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     socklen_t addrlen = sizeof(address);
     int sock = shm_accept(server_fd, (struct sockaddr *)&address, &addrlen);
 
-    client_info->shm_sock = sock;
+    client_info_->shm_sock = sock;
+
+    VLOG(1) << "AcceptShmConnection: shm_sock: " << sock;
 
     connManager_->setShmSocket(sock);
-
-    auto start = std::chrono::steady_clock::now();
-    uint64_t cnt = 0;
-
-    while(1) {
-        // 等待客户端通知
-        sem_wait(sem_w);  // 信号量 -1，等待信号
-
-        ssize_t bytes_read = shm_read(sock, client_info->recv_buff, sizeof(client_info->recv_buff));
-        if (bytes_read < 0) {
-            LOG(ERROR) << "Failed to read from socket";
-            break;
-        }
-        client_info->recv_buff[bytes_read] = '\0'; // 确保字符串结束
-        VLOG(1) << "Read from shared memory: " << client_info->recv_buff;
-
-        // 等待数据处理完毕
-        scheduleRequests(client_info->recv_buff, start, cnt);
-        
-        VLOG(1) << "Sent to remote server ";
-        request_shm_counts_++;
-    }
-
-    // close shm socket
-    if (close(client_info->sock) == -1) {
-        LOG(ERROR) << "Failed to close listening socket";
-        cleanup_shared_memory(1);
-    }
-    LOG(INFO) << "Closed listening socket " << client_info->sock;
-
-    sem_destroy(sem_w);
   }
 
   size_t calculateThroughput(std::chrono::steady_clock::time_point& lastTime, size_t& lastTotalBytes, size_t& lastTotalBytes_conn0, size_t& lastTotalBytes_conn1) {
@@ -923,14 +1075,24 @@ class ShmMdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
   }
 
   void start(std::string token) {
+    // networkThread and mergeDataThread are local ScopedEventBaseThreads.
+    // Their EventBases run in their own separate threads.
     folly::ScopedEventBaseThread networkThread("EchoClientThread");
     auto evb = networkThread.getEventBase();
     auto qEvb = std::make_shared<FollyQuicEventBase>(evb);
     folly::ScopedEventBaseThread mergeDataThread("MergeDataThread");
     auto mev = mergeDataThread.getEventBase();
     auto mEvb = std::make_shared<FollyQuicEventBase>(mev);
+    
+    // Get the current thread's class structure and generate an event base
+    folly::EventBase *currentEvb = new folly::EventBase();
+    shmEvb_ = std::make_shared<FollyQuicEventBase>(currentEvb); 
+    
 
-    connManager_ = std::make_shared<CliConnection>(100, mEvb);
+    LOG(INFO) << "Event base for the current thread is ready to use.";
+
+    connManager_ = std::make_shared<CliConnection>();
+    connManager_->setEventBase(mEvb);
     mptcp_sock_ = new struct mptcp_sock();
     mptcp_sock_->connManager = connManager_;
     fileName_ = "CHUNK_9999K.mp4";
@@ -992,6 +1154,8 @@ class ShmMdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
         settings.disableMigration = !enableMigration_;
 
         settings.shouldUseRecvmmsgForBatchRecv = true;
+
+        settings.idleTimeout = std::chrono::milliseconds(600000);
         
         if (enableStreamGroups_) {
           settings.notifyOnNewStreamsExplicitly = true;
@@ -1043,16 +1207,16 @@ class ShmMdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
     client_info_t client_info[MAX_CLIENTS];
 
      // 映射共享内存
-    void *ptr = alloc_shm("sem_r", sizeof(sem_t));
+    /*void *ptr = alloc_shm("sem_r", sizeof(sem_t));
     if(ptr == NULL){
         LOG_ERROR(__func__, "Alloc sem_r shm failed.");
         exit(EXIT_FAILURE);
     }
 
-    sem_r = (sem_t *)ptr;
+    sem_r = (sem_t *)ptr;*/
 
     /*init sem_r(process-shared read data from shm, default value = 0)*/
-    if (sem_init(sem_r, 1, 0) == -1) {
+    /*if (sem_init(sem_r, 1, 0) == -1) {
         perror("sem_r init failed");
         exit(EXIT_FAILURE);
     }
@@ -1063,22 +1227,114 @@ class ShmMdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
         exit(EXIT_FAILURE);
     }
 
-    sem_w = (sem_t *)wptr;
+    sem_w = (sem_t *)wptr;*/
 
     /*init sem_w(process-shared write data into shm, default value = 0)*/
-    if (sem_init(sem_w, 1, 0) == -1) {
+    /*if (sem_init(sem_w, 1, 0) == -1) {
         perror("sem_w init failed");
         exit(EXIT_FAILURE);
-    }
+    }*/
     
 
     startDone_.wait();
 
-    client_info[0].sock = -1;
-    client_info[0].client_id = 0;
-    client_info[0].config = config;
-    client_info[0].shm_config = shm_config;
-    ReadDataFromShm(&client_info[0]);
+    client_info_ = (client_info_t *)malloc(sizeof(client_info_t));
+
+    client_info_->sock = -1;
+    client_info_->client_id = 0;
+    client_info_->config = config;
+    client_info_->shm_config = shm_config;
+    memset(client_info_->send_buff, 0, sizeof(client_info_->send_buff));
+    memset(client_info_->recv_buff, 0, sizeof(client_info_->recv_buff));
+
+    // Call AcceptShmConnection() HERE, before shm_sock is used for FIFO paths
+    AcceptShmConnection();
+
+    // Now that client_info_->shm_sock is set by AcceptShmConnection, proceed with FIFO setup
+    shm_fifo_listen_ = "/tmp/cs_fifo_" + std::to_string(client_info_->shm_sock); 
+
+    // 检查并删除已存在的 shm_fifo_listen_
+    struct stat st_fifo_listen;
+    if (::stat(shm_fifo_listen_.c_str(), &st_fifo_listen) == 0) {
+        // 文件或 FIFO 已存在
+        LOG(INFO) << "Path " << shm_fifo_listen_ << " already exists. Removing it.";
+        if (::unlink(shm_fifo_listen_.c_str()) == -1) {
+            LOG(ERROR) << "Failed to remove existing " << shm_fifo_listen_ << ": " << strerror(errno);
+            exit(EXIT_FAILURE); // 如果无法删除，则关键操作失败
+        }
+    } else {
+        if (errno != ENOENT) {
+            // stat 失败不是因为文件不存在，而是其他错误
+            LOG(ERROR) << "Error checking status of " << shm_fifo_listen_ << ": " << strerror(errno);
+            exit(EXIT_FAILURE);
+        }
+        // 文件不存在，是期望的情况，后续 mkfifo 会创建它
+    }
+
+    // 创建 shm_fifo_listen_
+    if (::mkfifo(shm_fifo_listen_.c_str(), S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP) == -1) {
+        // 注意：这里不再检查 EEXIST，因为我们期望在 mkfifo 之前已经删除了它
+        LOG(ERROR) << "Failed to create listening FIFO " << shm_fifo_listen_ << ": " << strerror(errno);
+        exit(EXIT_FAILURE);
+    }
+    LOG(INFO) << "Successfully created listening FIFO: " << shm_fifo_listen_;
+
+    shm_listen_fd_ = ::open(shm_fifo_listen_.c_str(), O_RDONLY | O_NONBLOCK);
+    if (shm_listen_fd_ == -1) {
+        LOG(ERROR) << "Failed to open listening FIFO " << shm_fifo_listen_ << " for reading: " << strerror(errno);
+        exit(EXIT_FAILURE);
+    }
+    LOG(INFO) << "Listening FIFO " << shm_fifo_listen_ << " opened with fd: " << shm_listen_fd_;
+
+    try {
+        shm_fifo_handler_ = std::make_unique<LocalFifoEventHandler>(currentEvb, this);
+        // 1. 先调用 changeHandlerFD 设置要监听的文件描述符
+        shm_fifo_handler_->changeHandlerFD(folly::NetworkSocket::fromFd(shm_listen_fd_));
+        // 2. 然后再调用 registerHandler 注册事件
+        shm_fifo_handler_->registerHandler(folly::EventHandler::READ | folly::EventHandler::PERSIST);
+        LOG(INFO) << "Event handler registered for listening FIFO fd: " << shm_listen_fd_;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Exception while setting up event handler for listening FIFO: " << e.what();
+        exit(EXIT_FAILURE);
+    }
+
+    // 构建 sc_fifo (shm_fifo_write_) 的路径
+    shm_fifo_write_ = "/tmp/sc_fifo_" + std::to_string(client_info_->shm_sock);
+    LOG(INFO) << "Preparing sc_fifo: " << shm_fifo_write_;
+
+    struct stat st_fifo_write;
+    if (::stat(shm_fifo_write_.c_str(), &st_fifo_write) == 0) {
+        LOG(INFO) << "Path " << shm_fifo_write_ << " already exists. ";
+    }else{
+        // 创建 FIFO
+        if (::mkfifo(shm_fifo_write_.c_str(), S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP) == -1) {
+            LOG(ERROR) << "Failed to create sc_fifo " << shm_fifo_write_ << ": " << strerror(errno);
+            exit(EXIT_FAILURE);
+        }
+        LOG(INFO) << "Successfully created sc_fifo: " << shm_fifo_write_;
+    }
+
+    LOG(INFO) << "Attempting to open sc_fifo (shm_fifo_write_: " << shm_fifo_write_ << ") for writing...";
+    auto start_time = std::chrono::steady_clock::now();
+    while (shm_write_fd_ == -1) {
+        shm_write_fd_ = ::open(shm_fifo_write_.c_str(), O_WRONLY | O_NONBLOCK);
+        if (shm_write_fd_ == -1) {
+            if (std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - start_time)
+                    .count() >= 10) {
+                LOG(ERROR) << "Timeout: Failed to open write FIFO '" << shm_fifo_write_
+                          << "' after 10 seconds. Error: " << strerror(errno);
+                exit(EXIT_FAILURE);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+
+    
+    LOG(INFO) << "Successfully opened sc_fifo (shm_fifo_write_: " << shm_fifo_write_
+                << ") for writing with fd: " << shm_write_fd_;
+
+    currentEvb->loopForever();
 
     // loop until Ctrl+D
     //generateRequests(1);
@@ -1164,10 +1420,19 @@ class ShmMdlwClient :  public quic::QuicSocket::ConnectionSetupCallback,
   std::string frameLabel_;
   std::shared_ptr<CliConnection> connManager_;
   struct mptcp_sock* mptcp_sock_;
+  client_info_t *client_info_{nullptr};
   sem_t *sem_r{nullptr};
   sem_t *sem_w{nullptr};
+  std::string shm_fifo_listen_;
+  std::string shm_fifo_write_;
+  int shm_listen_fd_{-1};
+  int shm_write_fd_{-1};
+  std::shared_ptr<FollyQuicEventBase> shmEvb_{nullptr};
+  std::unique_ptr<folly::EventHandler> shm_fifo_handler_{nullptr};
   uint64_t request_shm_counts_{0};
   uint64_t response_shm_counts_{0};
+  ssize_t *notify_buffer_{nullptr};
+  ssize_t *recv_length_{nullptr};
 };
 
-} // namespace quic::samples
+} // namespace quic::opv_shm

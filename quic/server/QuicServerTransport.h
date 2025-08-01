@@ -287,14 +287,33 @@ typedef struct {
     int conn_num;
 } config_t;
 
+#define BUFFER_SIZE 4096
+
+typedef struct {
+    int client_id;
+    int sock;
+    int shm_sock;
+    config_t *config;
+    quic::StreamId stream_id;
+    char send_buff[BUFFER_SIZE];
+    char recv_buff[BUFFER_SIZE];
+} client_info_t;
+
 class SrvConnection : public ConnectionManager {
  public:
-  virtual ~SrvConnection() override = default;
+  virtual ~SrvConnection() override { 
+    VLOG(1) << "SrvConnection has been destructed " << this; 
+  }
 
-  SrvConnection(uint64_t capacity, std::shared_ptr<FollyQuicEventBase> fEvb) : ConnectionManager(capacity) {
-    fEvb_ = fEvb;
+  SrvConnection() : ConnectionManager() {
+    capacity_ = 100;
     connections_ = std::unordered_map<int64_t, std::shared_ptr<QuicServerTransport>>();
   }
+
+  void setEventBase(std::shared_ptr<FollyQuicEventBase> fEvb) {
+    fEvb_ = fEvb;
+  }
+
   // Add connection
   void addConnection(int64_t connectionId, std::shared_ptr<QuicServerTransport> connection) {
     if (connectionId > -1) {
@@ -307,6 +326,8 @@ class SrvConnection : public ConnectionManager {
     }else 
         LOG(ERROR) << "ConnIdx is empty" ;
   }
+
+  
 
   void setScheduler(std::string scheduler, struct mptcp_sock* mptcp_sock) {
     mptcp_sock_ = mptcp_sock;
@@ -359,7 +380,7 @@ class SrvConnection : public ConnectionManager {
 
   std::shared_ptr<FollyQuicEventBase> getEventBase() {
     return fEvb_;
-  }
+  } 
 
  private:
   std::shared_ptr<FollyQuicEventBase> fEvb_;

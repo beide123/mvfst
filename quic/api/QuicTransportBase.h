@@ -272,19 +272,53 @@ class QuicTransportBase : public QuicSocket,
 
 // 添加 ConnectionManager 类的声明
 class ConnectionManager {
+ protected:
+  uint64_t capacity_;
+  int64_t shm_sock_{-1};
+  std::string frameLabel_;
+  std::unordered_map<int64_t, StreamId> clientStreams_;
+  std::unordered_map<uint64_t, std::shared_ptr<QuicSocket::ChunkData>> chunkCache_;
+  
+  size_t chunkOffset_{0};
+  size_t chunkTarget_{0};
+  uint64_t sequenceNumber_{0};
+  uint64_t expectedSequenceNumber_{0};
+  
+  std::unordered_map<int64_t, size_t> incompFrameLabelLen_;
+  std::unordered_map<int64_t, int64_t> imcompSeqLen_;
+  std::unordered_map<int64_t, int64_t> imcompOffsetLen_;
+
+  std::unordered_map<int64_t, uint64_t> lastReceivedSeq_;
+
+  std::unordered_map<int64_t, std::string> imcompSeq_;
+  std::unordered_map<int64_t, std::string> imcompOffset_;
+
+  static constexpr std::size_t kDestroyBatch = 512;
+  std::vector<std::shared_ptr<QuicSocket::ChunkData>> pendingDestruction_;
+
+  RingBuffer<char> shmPool_;
+
+  uint64_t duration_ = 0;
+  uint64_t count_ = 0;
+
  public:
   // Add virtual destructor
-  virtual ~ConnectionManager() = default;
+  virtual ~ConnectionManager() {
+    VLOG(1) << "ConnectionManager has been destructed";
+  }
 
-  ConnectionManager(uint64_t capacity) : capacity_(capacity) 
+  ConnectionManager()
+  : shmPool_(10 * 1024 * 1024)
   {
+    capacity_ = 100;
     lastReceivedSeq_ = std::unordered_map<int64_t, uint64_t>();
     imcompOffsetLen_ = std::unordered_map<int64_t, int64_t>();
     imcompSeqLen_ = std::unordered_map<int64_t, int64_t>();
     imcompOffset_ = std::unordered_map<int64_t, std::string>();
     imcompSeq_ = std::unordered_map<int64_t, std::string>();
-    incompFrameLen_ = std::unordered_map<int64_t, size_t>();
+    incompFrameLabelLen_ = std::unordered_map<int64_t, size_t>();
     chunkCache_ =  std::unordered_map<uint64_t, std::shared_ptr<QuicSocket::ChunkData>>();
+    reserverChunkCache();
   }
 
   virtual std::vector<int64_t> getAllConnectionIds() = 0;
@@ -293,12 +327,499 @@ class ConnectionManager {
 
   virtual uint64_t getsize() = 0;
 
+  std::function<void(const char*, size_t)> dataCallback_;
+
   void setShmSocket(int64_t shm_sock) {
     shm_sock_ = shm_sock;
   }
 
   int64_t getShmSocket() {
     return shm_sock_;
+  }
+
+  void setDataCallback(std::function<void(const char*, size_t)> dataCallback) {
+    dataCallback_ = dataCallback;
+  }
+
+  void sendDataToApp(const char* data, size_t dataLength) {
+    if(dataCallback_) {
+      dataCallback_(data, dataLength);
+    }else{
+      LOG(ERROR) << "sendDataToApp callback is not set";
+    }
+  }
+
+  bool isTailHasIncompFrame(const std::string& data, int64_t connId, size_t len, size_t start, size_t& pos, bool hasLabel){
+    // 检查末尾4个字符
+    std::string tail = frameLabel_.substr(0, 4);
+    size_t headLen = sizeof(uint64_t) + sizeof(size_t);
+    for(size_t i = tail.length(); i > 0; i--){
+      if(len >= i && data.substr(len - i) == tail.substr(0, i)){
+        pos = len - i;
+        if(hasLabel && (start + headLen >= pos)){
+          return false;
+        }
+        setIncompFrameLabelLen(connId, i);
+        VLOG(1) << "Check tail has incomp frame label 'FRAME', connId = " << connId
+            << ", start = " << start
+            << ", pos = " << pos
+            << ", data = " << data.substr(pos);
+        return true;
+      }
+    }
+    return false;
+  }
+
+
+  bool isHeadMergeToFrame(const std::string& data, int64_t connId, size_t& left){
+    size_t incompFrameLabelLen = getIncompFrameLabelLen(connId);
+    
+    std::string head = frameLabel_;
+    size_t headLen = head.length(), leftLen = headLen - incompFrameLabelLen;
+
+    VLOG(1) << "Check if head merge to frame, connId = " << connId
+            << ", incompFrameLabelLen = " << incompFrameLabelLen
+            << ", left = " << left
+            << ", data = " << data.substr(0, leftLen);
+    
+    if(incompFrameLabelLen > 0 && incompFrameLabelLen < headLen){
+      std::string prefix = head.substr(0, incompFrameLabelLen);
+      if(prefix + data.substr(0, leftLen) == head){
+        left = leftLen;
+        VLOG(1) << "Can merge head to frame, connId = " << connId
+                << ", left = " << left;
+        return true;
+      }
+    }
+    
+    return false;
+  }
+
+  void processImcompleteHeader(int64_t connId, const char* data, size_t dataLength) {
+    if(dataLength < sizeof(uint64_t)){
+        VLOG(1) << "Detect imcomplete header seq, connId = " << connId
+                << ", dataLength = " << dataLength
+                << ", data = " << std::string(data, dataLength);
+        std::string imcompSeq(data, dataLength);
+        setImcompSeqLen(connId, dataLength);
+        setImcompSeq(connId, imcompSeq);
+
+        std::string imcompOffset("");
+        setImcompOffsetLen(connId, 0);
+        setImcompOffset(connId, imcompOffset);
+        VLOG(1) << "Detect imcomplete header seq, connId = " << connId
+                << ", writen offset = " << dataLength
+                << ", imcompSeq = " << imcompSeq;
+    }else{
+        uint64_t sequenceNumber = *reinterpret_cast<const uint64_t*>(data);
+        setLastReceivedSeq(connId, sequenceNumber);
+        data += sizeof(uint64_t);
+        VLOG(1) << "Detect imcomplete header offset, connId = " << connId
+                << ", dataLength = " << dataLength
+                << ", sequenceNumber = " << sequenceNumber
+                << ", data = " << std::string(data, dataLength - sizeof(uint64_t));
+        std::string imcompOffset(data, dataLength - sizeof(uint64_t));
+        
+        setImcompOffsetLen(connId, dataLength - sizeof(uint64_t));
+        setImcompOffset(connId, imcompOffset);
+        VLOG(1) << "Detect imcomplete header offset, connId = " << connId
+                << ", writen offset = " << dataLength - sizeof(uint64_t)
+                << ", imcompOffset = " << imcompOffset;
+    }
+  }
+
+  void processDatafield(int64_t connId, const char* data, size_t dataLength) {
+    // 不是帧头 处理数据字段
+    uint64_t expectedSequenceNumber = getExpectedSequenceNumber();
+    uint64_t lastReceivedSeq = getLastReceivedSeq(connId);
+
+    if(lastReceivedSeq == expectedSequenceNumber){
+        sendDataToApp(data, dataLength);
+        setChunkOffset(dataLength);
+        VLOG(1) << "Write data seq = " << expectedSequenceNumber 
+                << ", dataLength = " << dataLength
+                << ", chunkOffset = " << getChunkOffset()
+                << ", chunkTarget = " << getChunkTarget();
+        if(getChunkOffset() == getChunkTarget()){
+          expectedSequenceNumber++;
+          auto& chunkCache = getChunkCache();
+          auto it = chunkCache.find(expectedSequenceNumber);
+          while (it != chunkCache.end()) {
+              auto chunk = it->second;
+              char* cachedChunkData = chunk->data.get();
+              VLOG(1) << "Find cached seq = " << chunk->sequenceNumber
+                      << ", cached data ptr = " << (void*)chunk->data.get()
+                      << ", cached data length = " << chunk->offset
+                      << ", cached target = " << chunk->total;  
+              
+              sendDataToApp(cachedChunkData, chunk->offset);
+              
+              VLOG(1) << "Write cached seq =" << expectedSequenceNumber 
+                      << ", chunkoffset" << chunk->offset;
+
+              setChunkOffset(chunk->offset);
+              
+              setChunkTarget(chunk->total);
+              
+              if(getChunkOffset() == getChunkTarget()){
+                VLOG(1) << "Write cachedata seq =" << expectedSequenceNumber 
+                    << ", dataLength = " << chunk->offset  
+                    << ", chunkoffset = " << getChunkOffset()
+                    << ", chunkTarget = " << getChunkTarget();
+                chunkCache.erase(it);
+                expectedSequenceNumber++;
+                it = chunkCache.find(expectedSequenceNumber);
+              }else {
+                VLOG(1) << "Write cachedata seq =" << expectedSequenceNumber 
+                    << ", dataLength = " << chunk->offset  
+                    << ", chunkoffset = " << getChunkOffset()
+                    << ", chunkTarget = " << getChunkTarget();
+                chunkCache.erase(it);
+                break;
+              }
+          }
+          setExpectedSequenceNumber(expectedSequenceNumber);
+        }else if(getChunkOffset() > getChunkTarget()){
+          VLOG(1) << "Write data beyond target: " << 
+          data + dataLength - (getChunkOffset() - getChunkTarget());
+        }
+      }else{
+        auto& chunkCache = getChunkCache();
+        VLOG(1) << "lastReceivedSeq = " << lastReceivedSeq << " Address of chunkCache: " << &chunkCache;
+
+        auto it = chunkCache.find(lastReceivedSeq);
+        if(it == chunkCache.end()){
+          LOG(ERROR) << "Chunk not found in cache, connId = " << connId << " seq = " << lastReceivedSeq;
+          exit(1);
+        }
+
+        size_t oldLength = it->second->offset;
+        size_t total = it->second->total;
+        VLOG(1) << "ConnId = " << connId << " Find seq = " << lastReceivedSeq 
+        << ", address of chunk = " << it->second
+        << " data ptr = " << (void*)it->second->data.get()
+        << " before merge length = " << it->second->offset;
+
+        /*auto old_data_ptr = getChunkCache(lastReceivedSeq)->data;
+        char* old_data = old_data_ptr.get();*/
+        // 2. 计算新长度
+        size_t new_length = oldLength + dataLength; // +1 for null terminator
+
+        /*std::shared_ptr<char[]> new_data_ptr(new char[new_length]);
+
+        if(oldLength > 0){
+          std::memcpy(new_data_ptr.get(), old_data, oldLength);
+        }
+
+        std::memcpy(new_data_ptr.get() + oldLength, data, dataLength);
+       
+        // 7. 更新 connManager_ 中的 shared_ptr 和 length
+        getChunkCache(lastReceivedSeq)->data = new_data_ptr;*/
+        auto chunk = it->second;
+        if(new_length <= total){
+          std::memcpy(chunk->data.get() + oldLength, data, dataLength);
+        }else{
+          LOG(ERROR) << "Data length beyond target, connId = " << connId << "right length = " << total << "new_length = " << new_length;
+          exit(1);
+        }
+        chunk->offset = new_length;
+
+        VLOG(1) << "ConnId = " << connId << " seq = " << lastReceivedSeq 
+        << " data ptr = " << (void*)chunk->data.get()
+        << " merged data length = " << chunk->offset;
+      }
+    
+  }
+
+  void processHeaderfield(int64_t connId, const char* data, size_t dataLength) {
+      // Process frame header
+      // Check if the remaining frame header length is sufficient
+      uint64_t sequenceNumber = 0;
+      size_t targetOffset = 0;
+      uint64_t expectedSequenceNumber = getExpectedSequenceNumber();
+      size_t remaiLen = 0;
+
+      if(hasImcompSeqOrLen(connId)){
+        int64_t imcompSeqLen = getImcompSeqLen(connId);
+        int64_t imcompOffsetLen = getImcompOffsetLen(connId);
+
+        if(imcompSeqLen >= 0){
+          std::string imcompSeq = getImcompSeq(connId);
+          size_t remain = sizeof(uint64_t) - imcompSeqLen;
+          if(remain <= dataLength){
+              imcompSeq.append(data, remain);
+              VLOG(1) << "Process imcomplete seq, connId = " << connId
+                      << ", writen offset = " << remain
+                      << ", imcompSeq = " << imcompSeq;
+              sequenceNumber = *reinterpret_cast<const uint64_t*>(imcompSeq.c_str());
+              data += remain;
+              dataLength -= remain;
+              setLastReceivedSeq(connId, sequenceNumber);
+              setImcompSeqLen(connId, -1);
+          }else{
+              imcompSeq.append(data, dataLength);
+              setImcompSeq(connId, imcompSeq);
+              setImcompSeqLen(connId, imcompSeqLen + dataLength);
+              return;
+          }
+        }
+        
+        if(imcompOffsetLen >= 0){
+          std::string imcompOffset = getImcompOffset(connId);
+          size_t remain = sizeof(size_t) - imcompOffsetLen;
+          VLOG(1) << "Process imcomplete offset, connId = " << connId
+                  << ", dataLength bytes = " << imcompOffsetLen
+                  << ", imcompOffset = " << imcompOffset;
+          if(remain <= dataLength){
+            imcompOffset.append(data, remain);
+            sequenceNumber = getLastReceivedSeq(connId);
+            
+            targetOffset = *reinterpret_cast<const size_t*>(imcompOffset.c_str());
+            data += remain;
+            dataLength -= remain;
+            VLOG(1) << "Process imcomplete offset, connId = " << connId
+                    << ", sequenceNumber = " << sequenceNumber
+                    << ", targetOffset = " << targetOffset;
+
+            setImcompOffsetLen(connId, -1);
+          }else{
+            imcompOffset.append(data, dataLength);
+            setImcompOffset(connId, imcompOffset);
+            setImcompOffsetLen(connId, imcompOffsetLen + dataLength);
+            return;
+          }
+        }
+      }else{
+        if (dataLength < sizeof(uint64_t) + sizeof(size_t)) {
+            processImcompleteHeader(connId, data, dataLength);
+            return;
+        }
+
+        if(sequenceNumber == 0){
+          sequenceNumber = *reinterpret_cast<const uint64_t*>(data);
+          data += sizeof(uint64_t);
+          dataLength -= sizeof(uint64_t);
+        }
+
+        if(targetOffset == 0){  
+          targetOffset = *reinterpret_cast<const size_t*>(data);
+          data += sizeof(size_t);
+          dataLength -= sizeof(size_t);
+        }
+      }
+      
+      remaiLen = dataLength;
+      
+      
+      VLOG(1) << "Found frame header: seq=" << sequenceNumber 
+              << ", targetOffset=" << targetOffset
+              << ", dataLength=" << dataLength;
+      
+      if(targetOffset < remaiLen){
+          LOG(ERROR) << "Data length beyond target, connId = " << connId << "beyond = " << data + targetOffset;
+          exit(1);
+      }
+
+      if (sequenceNumber == expectedSequenceNumber) {
+          // 设置到 connManager 中
+          setChunkTarget(targetOffset);
+
+          sendDataToApp(data, remaiLen);
+        
+          setChunkOffset(remaiLen);
+
+          // 写入数据
+          VLOG(1) << "Write expected seq = " << sequenceNumber 
+                  << ", dataLength = " << remaiLen
+                  << ", chunkOffset = " << getChunkOffset()
+                  << ", chunkTarget = " << getChunkTarget();
+
+          setLastReceivedSeq(connId, expectedSequenceNumber);
+          if(getChunkOffset() == getChunkTarget()){
+            expectedSequenceNumber++;
+            // 检查缓存中是否有后续连续的 chunk
+            auto& chunkCache = getChunkCache();
+            auto it = chunkCache.find(expectedSequenceNumber);
+            while (it != chunkCache.end()) {
+                auto cachedChunk = it->second;
+                char* cachedChunkData = cachedChunk->data.get();
+                size_t cachedChunkLen = cachedChunk->offset;
+
+                setChunkTarget(cachedChunk->total);
+              
+                sendDataToApp(cachedChunkData, cachedChunkLen);
+                
+                setChunkOffset(cachedChunk->offset);
+
+                if(getChunkOffset() == getChunkTarget()){
+                  VLOG(1) << "Write cached seq =" << expectedSequenceNumber 
+                      << ", dataLength = " << cachedChunk->offset
+                      << ", chunkoffset = " << getChunkOffset()
+                      << ", chunkTarget = " << getChunkTarget();
+                  chunkCache.erase(it);
+                  expectedSequenceNumber++;
+                  it = chunkCache.find(expectedSequenceNumber);
+                }else {
+                  VLOG(1) << "Write cached seq =" << expectedSequenceNumber 
+                      << ", dataLength = " << cachedChunk->offset
+                      << ", chunkoffset = " << getChunkOffset()
+                      << ", chunkTarget = " << getChunkTarget();
+                  chunkCache.erase(it);
+                  break;
+                }
+                
+            }
+            setExpectedSequenceNumber(expectedSequenceNumber);
+            VLOG(1) << "Now the expected seq = " << expectedSequenceNumber;
+          }
+        
+      } else {
+          // not expected sequence number, put into cache
+          auto& pool = getShmPool();
+
+          std::shared_ptr<quic::QuicSocket::ChunkData> chunk = std::make_shared<quic::QuicSocket::ChunkData>(
+            sequenceNumber,
+            targetOffset,
+            remaiLen,
+            pool,
+            data
+          );
+
+          setChunkCache(sequenceNumber, chunk);
+
+          VLOG(1) << "Address of chunk object = " 
+          << (void*)chunk.get() << ", address stored in cache = " 
+          << (void*)getChunkCache(sequenceNumber).get(); // .get() 获取原始指针
+
+          setLastReceivedSeq(connId, sequenceNumber);
+
+          auto cachedChunkPtr = getChunkCache(sequenceNumber);
+          if (cachedChunkPtr && cachedChunkPtr->data) {
+              VLOG(1) << "ConnId = " << connId << " Received unexpected header, seq = " << sequenceNumber 
+                      << ", data ptr = " << (void*)cachedChunkPtr->data.get() // 假设 data 是 shared_ptr<char>
+                      << ", dataLength = " << cachedChunkPtr->offset;
+          } else {
+              VLOG(1) << "ConnId = " << connId << " Received unexpected header, seq = " << sequenceNumber 
+                      << ", but cached chunk or data pointer is null.";
+          }
+      }
+  }
+
+  void mergeData(folly::IOBuf* data, size_t dataLength, int64_t connId, std::string frameLabel) {
+      static uint64_t expectedSequenceNumber = getExpectedSequenceNumber();
+      
+      const char* originalData = (const char*)data->data();
+
+      std::string currentData(originalData, dataLength);
+
+      size_t start = 0, pos = 0, str_len = strlen(frameLabel.c_str()), left = 0;
+
+      frameLabel_ = frameLabel;
+
+      if(isIncompleteFrameLabel(connId)){
+        //Check if the head can merge to frame label "FRAME"
+        if(isHeadMergeToFrame(currentData, connId, start)){
+          //Merge successfully, find the next frame header position
+          pos = currentData.find(frameLabel_, start);
+          if (pos != std::string::npos) {
+              // Find the next frame header, process the data ahead of it
+              VLOG(1) << "Process frame head merge to frame, connId = " << connId
+                      << ", start = " << start << ", pos = " << pos;
+              processHeaderfield(connId, originalData + start, pos - start);
+              removeIncompFrameLabelLen(connId);
+              start = pos;
+          } else {
+              // Not found next "Frame" label, choose the processing function based on tail completion
+              if (isTailHasIncompFrame(currentData, connId, dataLength, start, pos, true)) {
+                  VLOG(1) << "Process frame head merge with incomp tail, connId = " << connId
+                          << ", start = " << start << ", pos = " << pos;
+                  processHeaderfield(connId, originalData + start, pos - start);
+              } else {
+                  VLOG(1) << "Process frame head merge without tail, connId = " << connId
+                          << ", start = " << start << ", pos = " << pos;
+                  processHeaderfield(connId, originalData + start, dataLength - start);
+                  removeIncompFrameLabelLen(connId);
+              }
+              start = dataLength;
+          }
+        }else{
+          //Merge failed, write the last stored string into file
+          size_t lastLen = getIncompFrameLabelLen(connId);
+          const char* last = frameLabel_.c_str();
+          processDatafield(connId, last, lastLen);
+          removeIncompFrameLabelLen(connId);
+        }
+      }
+    
+      while (start < dataLength) {
+        //Find next frame header position
+        size_t pos = currentData.find(frameLabel_, start);
+        if(pos != std::string::npos){
+            if(pos > start){
+                /*Find the next frame header "FRAME" Process data ahead of it */
+              
+                if(hasImcompSeqOrLen(connId)){
+                  //Last frame header has imcomplete sequence number or offset, merge it
+                  processHeaderfield(connId, originalData + start, pos - start);
+                }else{
+                  //Process datafield
+                  VLOG(1) << "Process datafield, connId = " << connId 
+                          << ", start = " << start << ", pos = " << pos
+                          << ", dataLength = " << pos - start;
+                  processDatafield(connId, originalData + start, pos - start);
+                }
+            }
+
+            //Start to process the next frame header, strip the "FRAME" label
+            start = pos + str_len;
+            
+            //Find the next frame header position
+            size_t nxt_pos = currentData.find(frameLabel_, start);
+
+            if(nxt_pos == std::string::npos){
+              //No next frame header, check if the tail has incompleted label "FRAME"
+              if(!isTailHasIncompFrame(currentData, connId, dataLength, start, nxt_pos, true)){
+                /*There's no frame label "FRAME" in the tail part, set the position of data to be processed as the end, 
+                  else use the nxt_pos as the position*/
+                nxt_pos = dataLength;
+              }
+            }
+            
+            processHeaderfield(connId, originalData + start, nxt_pos - start);
+
+            if(isIncompleteFrameLabel(connId)){
+              start = dataLength;
+            }else{
+              start = nxt_pos;
+            }
+
+        }else if(isTailHasIncompFrame(currentData, connId, dataLength, start, pos, false)){
+            //Tail has incomp frame label "FRAME", process the data before it
+            VLOG(1) << "Tail has incomp frame label, connId = " << connId 
+                  << "start = " << start << ", pos = " << pos;
+            //The label start position is pos, process the data before it
+            if(hasImcompSeqOrLen(connId)){
+              /*Last frame header has imcomplete sequence number or offset, merge it and process the data between the 
+              start and the tail frame label*/
+              processHeaderfield(connId, originalData + start, pos - start);
+            }else{
+              //Process datafield
+              processDatafield(connId, originalData + start, pos - start);
+            }
+            //The whole data is finished, set the start to dataLength
+            start = dataLength;
+        }else{
+            //No Frame labelor tail, just process the data
+            if(hasImcompSeqOrLen(connId)){
+              //Process the data with imcomplete sequence number or offset
+              processHeaderfield(connId, originalData + start, dataLength - start);
+            }else{
+              //Process the datafield
+              processDatafield(connId, originalData + start, dataLength - start);
+            }
+            start = dataLength;
+        }
+     }
   }
 
   // Build clientStreams_ mapping
@@ -327,6 +848,14 @@ class ConnectionManager {
 
   uint64_t getExpectedSequenceNumber() {
     return expectedSequenceNumber_;
+  }
+
+  uint64_t getSequenceNumber() {
+    return sequenceNumber_;
+  }
+
+  void setSequenceNumber(uint64_t sequenceNumber) {
+    sequenceNumber_ = sequenceNumber;
   }
 
   size_t getChunkOffset() {
@@ -369,7 +898,7 @@ class ConnectionManager {
     return -1;
   }
 
-  bool hasImcomp(int64_t connectionId) {
+  bool hasImcompSeqOrLen(int64_t connectionId) {
     return getImcompOffsetLen(connectionId) > -1
     || getImcompSeqLen(connectionId) > -1;
   }
@@ -398,42 +927,64 @@ class ConnectionManager {
     imcompSeq_[connectionId] = imcompSeq;
   }
 
-  size_t getIncompFrameLen(int64_t connectionId) {
-    return incompFrameLen_[connectionId];
+  size_t getIncompFrameLabelLen(int64_t connectionId) {
+    return incompFrameLabelLen_[connectionId];
   }
 
-  void setIncompFrameLen(int64_t connectionId, size_t incompFrameLen) {
-    incompFrameLen_[connectionId] = incompFrameLen;
+  void setIncompFrameLabelLen(int64_t connectionId, size_t incompFrameLen) {
+    incompFrameLabelLen_[connectionId] = incompFrameLen;
   }
 
-  void removeIncompFrameLen(int64_t connectionId) {
-    auto it = incompFrameLen_.find(connectionId);
-    if(it != incompFrameLen_.end()) {
-      incompFrameLen_.erase(it);
+  RingBuffer<char>& getShmPool() {
+    return shmPool_;
+  }
+
+  void removeIncompFrameLabelLen(int64_t connectionId) {
+    auto it = incompFrameLabelLen_.find(connectionId);
+    if(it != incompFrameLabelLen_.end()) {
+      incompFrameLabelLen_.erase(it);
     }
   }
 
-  bool isIncompleteFrame(int64_t connectionId) {
-    auto it = incompFrameLen_.find(connectionId);
-    if(it != incompFrameLen_.end()) {
+  bool isIncompleteFrameLabel(int64_t connectionId) {
+    auto it = incompFrameLabelLen_.find(connectionId);
+    if(it != incompFrameLabelLen_.end()) {
       return true;
     }
     return false;
   }
 
+  void reserverChunkCache() {
+      size_t capacity = 1 << 21;
+      chunkCache_.reserve(capacity);
+      chunkCache_.max_load_factor(0.75f);
+      pendingDestruction_.reserve(kDestroyBatch);
+  }
+
   void setChunkCache(uint64_t sequenceNumber, std::shared_ptr<QuicSocket::ChunkData> chunk) {
-    chunkCache_[sequenceNumber] = chunk;
+    chunkCache_[sequenceNumber] = std::move(chunk);
+    if (chunkCache_.size() > chunkCache_.bucket_count() * 0.75f * 0.95f) {  // 95%水位触发
+        size_t newBucketCount = chunkCache_.bucket_count() * 2;     // 翻倍扩容
+        chunkCache_.reserve(newBucketCount);
+    }
   }
 
   void removeChunkCache(uint64_t sequenceNumber) {
-    chunkCache_.erase(sequenceNumber);
+    auto it = chunkCache_.find(sequenceNumber);
+    if (it != chunkCache_.end()) {
+        /* delay destroy */
+        /*pendingDestruction_.push_back(std::move(it->second));
+        if (pendingDestruction_.size() >= kDestroyBatch) {
+            pendingDestruction_.clear();    // trigger batch destroy
+        }*/
+        chunkCache_.erase(it);
+    }
   }
 
   void emptyChunkCache(uint64_t sequenceNumber) {
     auto it = chunkCache_.find(sequenceNumber);
     if (it != chunkCache_.end()) {
-      it->second->offset = 0;
-      it->second->total = 0;
+      it->second->reset();
     }
   }
 
@@ -444,25 +995,6 @@ class ConnectionManager {
     }
     return nullptr;
   }
-
- protected:
-  uint64_t capacity_;
-  int64_t shm_sock_{-1};
-  std::unordered_map<int64_t, StreamId> clientStreams_;
-  std::unordered_map<uint64_t, std::shared_ptr<QuicSocket::ChunkData>> chunkCache_;
-  
-  size_t chunkOffset_{0};
-  size_t chunkTarget_{0};
-  uint64_t expectedSequenceNumber_{0};
-  
-  std::unordered_map<int64_t, size_t> incompFrameLen_;
-  std::unordered_map<int64_t, int64_t> imcompSeqLen_;
-  std::unordered_map<int64_t, int64_t> imcompOffsetLen_;
-
-  std::unordered_map<int64_t, uint64_t> lastReceivedSeq_;
-
-  std::unordered_map<int64_t, std::string> imcompSeq_;
-  std::unordered_map<int64_t, std::string> imcompOffset_;
 };
 
 struct sock{
@@ -611,7 +1143,7 @@ public:
                  << " last ack: " << lastAck.time_since_epoch().count() 
                  << " idle duration ms: " << idle_duration_ms.count();
                  
-        const uint64_t maxIdleTimeMs = 1000 * 60; 
+        const uint64_t maxIdleTimeMs = 10000 * 60; 
         if (idle_duration_ms.count() > maxIdleTimeMs) {
             LOG(ERROR) << "Subflow " << id << " inactive for too long (" << idle_duration_ms.count() << "ms)";
             return false;

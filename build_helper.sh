@@ -373,7 +373,9 @@ cd "$MVFST_BUILD_DIR" || exit
 mvfst_cmake_build_args=(
   -DCMAKE_PREFIX_PATH="$FOLLY_INSTALL_DIR"        \
   -DCMAKE_INSTALL_PREFIX="$MVFST_INSTALL_DIR"     \
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo               \
+#  -DCMAKE_BUILD_TYPE=RelWithDebInfo               \
+  -DCMAKE_BUILD_TYPE=Debug
+  -DCMAKE_CXX_FLAGS="-fsanitize=address"          \
   -DBUILD_TESTS=On                                \
   ${CMAKE_EXTRA_ARGS[@]+"${CMAKE_EXTRA_ARGS[@]}"} \
 )
