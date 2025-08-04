@@ -1,0 +1,5 @@
+server_ip=30.1.1.100
+port=6666
+packet_length=1024
+test_duration=120
+conn_num=2
